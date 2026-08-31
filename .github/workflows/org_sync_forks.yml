@@ -1,0 +1,184 @@
+# Scheduled org job: fast-forward simp's pure-mirror forks from upstream
+# ------------------------------------------------------------------------------
+#
+# This is NOT a reusable workflow — it runs here, on a schedule, and reaches
+# out to the org through the API. There is no per-repo shim, because there is
+# nothing in the module repos to trigger it. See simp/puppetsync#85 for why
+# scheduled reconcilers belong in this repo.
+#
+# Replaces Backstroke, which the org used for this until ~2017 and whose
+# server repo has been unmaintained since 2019-01. Uses GitHub's native
+# `merge-upstream` API rather than a third-party app, so no external service
+# holds write access to ~75 repos.
+#
+# ==============================================================================
+# Secrets:
+#
+#   GitHub Secret variable               Notes
+#   -------------------------------      ---------------------------------------
+#   SIMP_AUTO_GITHUB_TOKEN__REPO_SCOPE   PAT with `repo` scope. Required: this
+#                                        job writes to *other* repositories, so
+#                                        the workflow's own GITHUB_TOKEN cannot
+#                                        be used. Without it the job fails
+#                                        rather than silently skipping.
+#
+# ------------------------------------------------------------------------------
+# What it does, per non-archived fork in the simp org:
+#
+#   1. Resolve the fork's parent and both default branches.
+#   2. Compare `simp:<default>` against `<parent>:<default>`.
+#   3. Sync ONLY when the fork has **zero commits of its own** and is behind.
+#
+# Step 3 is the safety property. It is a pre-check, not a reliance on
+# `merge-upstream` refusing: that endpoint reports a `merge_type` which can be
+# a real merge rather than a fast-forward, so a diverged branch could pick up a
+# merge commit. Requiring `ahead_by == 0` on our side means only strictly-behind
+# branches are ever touched, and any fork that gains a SIMP-only commit drops
+# out of the job automatically — no allow-list to maintain.
+#
+# Consequences worth knowing:
+#
+# * Only the **default branch** is synced. Side branches such as the historical
+#   `simp-master` on many vendored forks are never touched, and neither are
+#   tags. Those branches carry the org's pre-6.x SIMP patches.
+#
+# * Forks that carry SIMP patches are skipped by design, not by exception:
+#   `pupmod-simp-haveged`, `pupmod-voxpupuli-selinux`, and
+#   `puppet-module-skeleton` all fail the `ahead_by == 0` test. vox_selinux in
+#   particular cannot be automated at all — its `selinux` -> `vox_selinux`
+#   rename is committed to the fork, so every upstream change conflicts (330
+#   commits behind, 176 files in the diff). That needs the namespace decision
+#   in simp/puppetsync#68, not a sync job.
+#
+---
+name: 'ORG: Sync forks from upstream'
+
+on:
+  schedule:
+    # Mondays 07:17 UTC — before the biweekly board review, off the hour to
+    # avoid the top-of-hour scheduling backlog on GitHub's shared runners.
+    - cron: '17 7 * * 1'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (report what would be synced, change nothing)'
+        required: false
+        type: boolean
+        default: false
+      repo_filter:
+        description: 'Optional substring filter, to sync a single fork'
+        required: false
+        type: string
+        default: ''
+
+permissions: {}
+
+jobs:
+  sync-forks:
+    name: 'Fast-forward pure-mirror forks'
+    runs-on: ubuntu-latest
+    steps:
+      - name: 'Assert a cross-repo token is available'
+        env:
+          GH_TOKEN: ${{ secrets.SIMP_AUTO_GITHUB_TOKEN__REPO_SCOPE }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            printf '::error ::SIMP_AUTO_GITHUB_TOKEN__REPO_SCOPE is not set. '
+            printf 'This job writes to other repositories and cannot use GITHUB_TOKEN.\n'
+            exit 1
+          fi
+
+      - name: 'Sync eligible forks'
+        env:
+          GH_TOKEN: ${{ secrets.SIMP_AUTO_GITHUB_TOKEN__REPO_SCOPE }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          REPO_FILTER: ${{ inputs.repo_filter }}
+        run: |
+          set -euo pipefail
+
+          synced=0; current=0; skipped=0; failed=0
+
+          {
+            echo '## Fork sync'
+            [ "${DRY_RUN}" = 'true' ] && echo '**Dry run — no changes made.**'
+            echo
+            echo '| Fork | Upstream | Result |'
+            echo '|---|---|---|'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Non-archived, non-empty forks in the org
+          gh repo list simp --limit 500 --no-archived --json name,isFork,isEmpty \
+            --jq '.[] | select(.isFork and (.isEmpty | not)) | .name' \
+            | sort > /tmp/forks.txt
+
+          while read -r repo; do
+            if [ -n "${REPO_FILTER}" ] && [[ "$repo" != *"${REPO_FILTER}"* ]]; then
+              continue
+            fi
+
+            meta="$(gh api "repos/simp/${repo}" \
+              --jq '[.parent.full_name // "", .parent.default_branch // "", .default_branch] | @tsv')"
+            parent="$(printf '%s' "$meta" | cut -f1)"
+            parent_branch="$(printf '%s' "$meta" | cut -f2)"
+            our_branch="$(printf '%s' "$meta" | cut -f3)"
+
+            if [ -z "$parent" ]; then
+              echo "::notice ::${repo}: no accessible parent, skipping"
+              echo "| ${repo} | — | skipped (no parent) |" >> "$GITHUB_STEP_SUMMARY"
+              skipped=$((skipped + 1))
+              continue
+            fi
+
+            parent_owner="${parent%%/*}"
+
+            # ahead_by  = commits upstream has that we lack
+            # behind_by = commits we have that upstream lacks (i.e. SIMP patches)
+            if ! cmp_json="$(gh api \
+                  "repos/simp/${repo}/compare/simp:${our_branch}...${parent_owner}:${parent_branch}" \
+                  --jq '[.ahead_by, .behind_by] | @tsv' 2>/dev/null)"; then
+              echo "::warning ::${repo}: cannot compare against ${parent} (unrelated histories?)"
+              echo "| ${repo} | ${parent} | skipped (compare failed) |" >> "$GITHUB_STEP_SUMMARY"
+              skipped=$((skipped + 1))
+              continue
+            fi
+            behind="$(printf '%s' "$cmp_json" | cut -f1)"   # we are behind by
+            ours="$(printf '%s' "$cmp_json" | cut -f2)"     # our own commits
+
+            if [ "$ours" -ne 0 ]; then
+              echo "::notice ::${repo}: has ${ours} SIMP-only commit(s), not a pure mirror — skipping"
+              echo "| ${repo} | ${parent} | skipped (${ours} local commit(s)) |" >> "$GITHUB_STEP_SUMMARY"
+              skipped=$((skipped + 1))
+              continue
+            fi
+
+            if [ "$behind" -eq 0 ]; then
+              echo "| ${repo} | ${parent} | already current |" >> "$GITHUB_STEP_SUMMARY"
+              current=$((current + 1))
+              continue
+            fi
+
+            if [ "${DRY_RUN}" = 'true' ]; then
+              echo "| ${repo} | ${parent} | would sync (${behind} behind) |" >> "$GITHUB_STEP_SUMMARY"
+              synced=$((synced + 1))
+              continue
+            fi
+
+            if result="$(gh api --method POST "repos/simp/${repo}/merge-upstream" \
+                  -f "branch=${our_branch}" --jq '.merge_type' 2>&1)"; then
+              echo "| ${repo} | ${parent} | synced ${behind} commit(s) (\`${result}\`) |" >> "$GITHUB_STEP_SUMMARY"
+              synced=$((synced + 1))
+            else
+              echo "::warning ::${repo}: merge-upstream failed: ${result}"
+              echo "| ${repo} | ${parent} | **failed** |" >> "$GITHUB_STEP_SUMMARY"
+              failed=$((failed + 1))
+            fi
+          done < /tmp/forks.txt
+
+          {
+            echo
+            echo "**synced ${synced} · already current ${current} · skipped ${skipped} · failed ${failed}**"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Individual failures are reported as warnings and do not fail the run:
+          # one unreachable upstream should not mask an otherwise clean sweep.
+          echo "synced=${synced} current=${current} skipped=${skipped} failed=${failed}"

@@ -10,6 +10,16 @@ a fix is a tag bump here instead of a fleet-wide sync — and half-rolled-out
 changes (like [simp/puppetsync#84][84]) become structurally impossible.
 See [simp/puppetsync#85][85] for the background and migration plan.
 
+This repo holds two kinds of workflow:
+
+- **Reusable workflows** (`on: workflow_call`) — called by a thin shim in each
+  consuming repo. The original purpose of this repo.
+- **Org-level scheduled jobs** (`org_*`) — jobs that run *here* and reach out
+  to the org through the API. These have no per-repo shim, because there is
+  nothing in the other repos to trigger them. They are the right shape whenever
+  a task is fleet-wide and needs no per-repo configuration: one file to change,
+  idempotent, and it covers repos outside puppetsync's sync set for free.
+
 [reusing]: https://docs.github.com/en/actions/using-workflows/reusing-workflows
 [84]: https://github.com/simp/puppetsync/issues/84
 [85]: https://github.com/simp/puppetsync/issues/85
@@ -24,10 +34,12 @@ namespaced by the kind of repo they serve:
 | `puppet_*` | Puppet module (`pupmod-*`) repos |
 | `rubygem_*` | Ruby gem (`rubygem-*`) repos |
 | `rpm_*` | Anything that ships RPMs (shared across repo kinds) |
+| `org_*` | Org-level scheduled jobs that run in this repo (not `workflow_call`) |
 
 | Workflow | Purpose |
 |---|---|
 | [`puppet_create_release_tag.yml`](.github/workflows/puppet_create_release_tag.yml) | Validate `metadata.json`/CHANGELOG and create + push an annotated release tag (triggering the repo's `tag_deploy.yml`) |
+| [`org_sync_forks.yml`](.github/workflows/org_sync_forks.yml) | Weekly: fast-forward the org's pure-mirror forks from their upstreams. Skips any fork carrying SIMP commits |
 
 ## Calling a workflow
 
@@ -69,7 +81,8 @@ keeping rollouts deliberate and reviewable.
 
 ## What belongs here (and what doesn't)
 
-- **Here**: workflow *logic* shared across repos (`on: workflow_call` only).
+- **Here**: workflow *logic* shared across repos (`on: workflow_call`), and
+  org-level scheduled jobs that operate on the fleet through the API (`org_*`).
 - **`simp/github-action-*` repos**: single composite/Docker **actions**
   (things with an `action.yml`), e.g.
   [github-action-build-and-sign-pkg-single-rpm](https://github.com/simp/github-action-build-and-sign-pkg-single-rpm).
