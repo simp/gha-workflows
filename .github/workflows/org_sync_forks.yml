@@ -50,6 +50,37 @@
 #   commits behind, 176 files in the diff). That needs the namespace decision
 #   in simp/puppetsync#68, not a sync job.
 #
+# * Forks whose **upstream is archived** are skipped: `merge-upstream` returns
+#   404 for them. They are reported separately, since an archived upstream
+#   usually means the fork is an archival candidate too.
+#
+# ==============================================================================
+# Failure taxonomy
+#
+# `merge-upstream` is an API call, not a `git push` — but it still performs a
+# ref update server-side, so branch protection and rulesets apply to it exactly
+# as they would to a push. Every failure mode seen so far is a *permission or
+# policy* problem on the fork, not a problem with the sync itself:
+#
+#   PAT lacks `workflow` scope
+#       The incoming commits touch `.github/workflows/*`, and GitHub refuses to
+#       let a PAT write workflow files without that scope.
+#       Fix: add `workflow` scope to SIMP_AUTO_GITHUB_TOKEN__REPO_SCOPE.
+#
+#   Fork requires linear history
+#       `required_linear_history` is enabled on the fork while upstream merges
+#       its PRs, so the incoming history contains merge commits. This is
+#       structurally incompatible with mirroring and **no token scope fixes
+#       it**. Fix: disable required_linear_history on mirror forks.
+#
+#   Branch protection / ruleset blocks the ref update
+#       Required reviews, or an org-level ruleset, refusing a direct ref
+#       update. Fix: grant the token a bypass, or exclude mirror forks from
+#       the rule. Switching to PR-based sync is explicitly NOT the answer —
+#       mirrors should update without review.
+#
+# The run FAILS if any fork fails, so a partly-broken sweep cannot look green.
+#
 ---
 name: 'ORG: Sync forks from upstream'
 
@@ -96,7 +127,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          synced=0; current=0; skipped=0; failed=0
+          synced=0; current=0; skipped=0; failed=0; upstream_archived=0
+          : > /tmp/failures.txt
 
           {
             echo '## Fork sync'
@@ -130,6 +162,14 @@ jobs:
             fi
 
             parent_owner="${parent%%/*}"
+
+            # merge-upstream returns 404 when the upstream is archived
+            if [ "$(gh api "repos/${parent}" --jq '.archived' 2>/dev/null)" = 'true' ]; then
+              echo "::notice ::${repo}: upstream ${parent} is archived, skipping"
+              echo "| ${repo} | ${parent} | skipped (upstream archived) |" >> "$GITHUB_STEP_SUMMARY"
+              upstream_archived=$((upstream_archived + 1))
+              continue
+            fi
 
             # ahead_by  = commits upstream has that we lack
             # behind_by = commits we have that upstream lacks (i.e. SIMP patches)
@@ -168,17 +208,50 @@ jobs:
               echo "| ${repo} | ${parent} | synced ${behind} commit(s) (\`${result}\`) |" >> "$GITHUB_STEP_SUMMARY"
               synced=$((synced + 1))
             else
-              echo "::warning ::${repo}: merge-upstream failed: ${result}"
-              echo "| ${repo} | ${parent} | **failed** |" >> "$GITHUB_STEP_SUMMARY"
+              case "$result" in
+                *'workflow'*'scope'*)
+                  cause='PAT needs the workflow scope' ;;
+                *'must not contain merge commits'*)
+                  cause='fork requires linear history; upstream uses merge commits' ;;
+                *'protected branch'*)
+                  cause='branch protection blocks the ref update' ;;
+                *'rule violations'*)
+                  cause='ruleset blocks the ref update' ;;
+                *)
+                  cause="$(printf '%s' "$result" | tr -d '\n' | cut -c1-120)" ;;
+              esac
+              echo "::error ::${repo}: ${cause}"
+              echo "| ${repo} | ${parent} | **failed** — ${cause} |" >> "$GITHUB_STEP_SUMMARY"
+              printf '%s\t%s\n' "$cause" "$repo" >> /tmp/failures.txt
               failed=$((failed + 1))
             fi
           done < /tmp/forks.txt
 
           {
             echo
-            echo "**synced ${synced} · already current ${current} · skipped ${skipped} · failed ${failed}**"
+            echo "**synced ${synced} · already current ${current} · skipped ${skipped}"
+            echo "· upstream archived ${upstream_archived} · failed ${failed}**"
           } >> "$GITHUB_STEP_SUMMARY"
 
-          # Individual failures are reported as warnings and do not fail the run:
-          # one unreachable upstream should not mask an otherwise clean sweep.
-          echo "synced=${synced} current=${current} skipped=${skipped} failed=${failed}"
+          echo "synced=${synced} current=${current} skipped=${skipped}" \
+               "upstream_archived=${upstream_archived} failed=${failed}"
+
+          if [ "$failed" -gt 0 ]; then
+            {
+              echo
+              echo '### Failures by cause'
+              echo
+              echo 'Each of these is a permission or policy problem on the fork.'
+              echo 'Mirrors are meant to update without review, so the fix is to'
+              echo 'let the token through — not to switch to PR-based syncing.'
+              echo
+              cut -f1 /tmp/failures.txt | sort -u | while read -r cause; do
+                repos="$(grep -F "${cause}"$'\t' /tmp/failures.txt | cut -f2 | paste -sd', ' -)"
+                echo "- **${cause}** — ${repos}"
+              done
+            } >> "$GITHUB_STEP_SUMMARY"
+
+            printf '::error ::%s of %s eligible forks failed to sync\n' \
+              "$failed" "$((synced + failed))"
+            exit 1
+          fi
