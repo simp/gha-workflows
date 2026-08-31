@@ -16,11 +16,26 @@
 #
 #   GitHub Secret variable               Notes
 #   -------------------------------      ---------------------------------------
-#   SIMP_AUTO_GITHUB_TOKEN__REPO_SCOPE   PAT with `repo` scope. Required: this
-#                                        job writes to *other* repositories, so
-#                                        the workflow's own GITHUB_TOKEN cannot
-#                                        be used. Without it the job fails
-#                                        rather than silently skipping.
+#   SIMP_APP_ID                          GitHub App (org-owned) used to mint a
+#   SIMP_APP_PRIVATE_KEY                 short-lived installation token. This is
+#                                        the preferred credential: the App holds
+#                                        only Contents/Workflows/Actions write
+#                                        plus Metadata read, its tokens last one
+#                                        hour, and it is not tied to any user
+#                                        account.
+#
+#   SIMP_AUTO_GITHUB_TOKEN__REPO_SCOPE   Fallback PAT (simp-auto). Used only if
+#                                        the App secrets are absent. Note it
+#                                        CANNOT sync forks whose upstream
+#                                        modifies `.github/workflows/*` — it
+#                                        lacks the `workflow` scope — and it
+#                                        cannot bypass branch protection, since
+#                                        simp-auto is an org member rather than
+#                                        an admin. Both are why the App exists.
+#
+# This job writes to *other* repositories, so the workflow's own GITHUB_TOKEN
+# can never be used. If neither credential resolves, the job fails rather than
+# silently skipping.
 #
 # ------------------------------------------------------------------------------
 # What it does, per non-archived fork in the simp org:
@@ -62,10 +77,11 @@
 # as they would to a push. Every failure mode seen so far is a *permission or
 # policy* problem on the fork, not a problem with the sync itself:
 #
-#   PAT lacks `workflow` scope
-#       The incoming commits touch `.github/workflows/*`, and GitHub refuses to
-#       let a PAT write workflow files without that scope.
-#       Fix: add `workflow` scope to SIMP_AUTO_GITHUB_TOKEN__REPO_SCOPE.
+#   PAT needs the workflow scope
+#       The incoming commits touch `.github/workflows/*`. A classic PAT is
+#       refused unless it carries the `workflow` scope.
+#       Fix: run with the GitHub App credential, whose Workflows: write
+#       permission covers this. Only reachable on the PAT fallback path.
 #
 #   Fork requires linear history
 #       `required_linear_history` is enabled on the fork while upstream merges
@@ -108,20 +124,38 @@ jobs:
   sync-forks:
     name: 'Fast-forward pure-mirror forks'
     runs-on: ubuntu-latest
+    env:
+      APP_ID: ${{ secrets.SIMP_APP_ID }}
     steps:
-      - name: 'Assert a cross-repo token is available'
+      - name: 'Mint a GitHub App installation token'
+        id: app-token
+        if: env.APP_ID != ''
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.SIMP_APP_ID }}
+          private-key: ${{ secrets.SIMP_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: 'Assert a cross-repo credential is available'
         env:
-          GH_TOKEN: ${{ secrets.SIMP_AUTO_GITHUB_TOKEN__REPO_SCOPE }}
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
+          PAT: ${{ secrets.SIMP_AUTO_GITHUB_TOKEN__REPO_SCOPE }}
         run: |
-          if [ -z "$GH_TOKEN" ]; then
-            printf '::error ::SIMP_AUTO_GITHUB_TOKEN__REPO_SCOPE is not set. '
-            printf 'This job writes to other repositories and cannot use GITHUB_TOKEN.\n'
+          if [ -n "$APP_TOKEN" ]; then
+            echo 'Using the GitHub App installation token.'
+          elif [ -n "$PAT" ]; then
+            printf '::warning ::Falling back to the simp-auto PAT. Forks whose '
+            printf 'upstream changes .github/workflows/* will fail to sync.\n'
+          else
+            printf '::error ::No cross-repo credential available (set SIMP_APP_ID '
+            printf '+ SIMP_APP_PRIVATE_KEY). This job writes to other repositories '
+            printf 'and cannot use GITHUB_TOKEN.\n'
             exit 1
           fi
 
       - name: 'Sync eligible forks'
         env:
-          GH_TOKEN: ${{ secrets.SIMP_AUTO_GITHUB_TOKEN__REPO_SCOPE }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.SIMP_AUTO_GITHUB_TOKEN__REPO_SCOPE }}
           DRY_RUN: ${{ inputs.dry_run }}
           REPO_FILTER: ${{ inputs.repo_filter }}
         run: |
