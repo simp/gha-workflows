@@ -1,0 +1,266 @@
+# Scheduled org job: reconcile Org Triage board Status from live PR state
+# ------------------------------------------------------------------------------
+#
+# Not a reusable workflow — it runs here on a schedule and reaches the org
+# project through the API. There is no per-repo shim, because PR events fire in
+# the owning repo and this job deliberately does not depend on them: a
+# reconciler is idempotent, so a missed event self-heals on the next pass
+# instead of leaving a card wrong forever. See simp/puppetsync#99.
+#
+# Board: https://github.com/orgs/simp/projects/11
+#
+# ==============================================================================
+# Mapping (members only)
+#
+#   Member PR, draft ................................ In Progress
+#   Member PR, ready for review ..................... In Review
+#   Member PR, changes requested .................... In Progress
+#   Member PR, approved but unmerged ................ In Review
+#   Issue with an open member PR that closes it ..... In Progress
+#   Anything authored from outside the org .......... UNTOUCHED
+#
+# "Member" means authorAssociation in MEMBER / OWNER / COLLABORATOR.
+#
+# Outside contributions are left alone deliberately. Marking a drive-by draft
+# "In Progress" would imply *we* are working it, and would drop it out of the
+# triage queue before anyone had looked. They stay in New, carrying the
+# `community` label, until a human picks them up.
+#
+# A consequence worth knowing: New ends up holding only issues and outside
+# contributions — i.e. exactly the things that need a human decision. A member's
+# own PR has a knowable state, so it does not need triaging.
+#
+# ==============================================================================
+# What it will never do
+#
+# * Move an item out of `Blocked` or `Parked`. Those are deliberate human
+#   placements with a recorded reason; a reconciler that overrode them would
+#   undo the board review's decisions on its next tick.
+# * Move an item out of `Done` (those auto-archive).
+# * Touch any field other than Status.
+#
+# Status option IDs are looked up **by name at run time**. Adding or renaming a
+# column mints new option IDs, so hardcoding them would break silently.
+#
+# ==============================================================================
+# Secrets:
+#
+#   SIMP_APP_ID / SIMP_APP_PRIVATE_KEY   Org-owned GitHub App. Needs no
+#                                        repository write for this job, but the
+#                                        token must be able to read org repos
+#                                        and write the project.
+#
+# The App can do this, but needs one permission it was not created with:
+#
+#     Organization permissions -> Projects: Read and write
+#
+# Repository permissions are not enough — the triage board is an *organization*
+# project. Add that permission (it triggers an install-approval prompt), and
+# this job uses the App like every other org_* job. Until then it falls back to
+# SIMP_PROJECT_TOKEN, a PAT carrying `project` scope.
+#
+---
+name: 'ORG: Reconcile triage board Status'
+
+on:
+  schedule:
+    # Hourly at :23. Cheap (a handful of API calls) and keeps the board close
+    # enough to live state that the biweekly review starts from something true.
+    - cron: '23 * * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (report the moves it would make, change nothing)'
+        required: false
+        type: boolean
+        default: false
+
+permissions: {}
+
+env:
+  ORG: simp
+  PROJECT_NUMBER: '11'
+
+jobs:
+  reconcile:
+    name: 'Reconcile Status from live PR state'
+    runs-on: ubuntu-latest
+    env:
+      APP_ID: ${{ secrets.SIMP_APP_ID }}
+    steps:
+      - name: 'Mint a GitHub App installation token'
+        id: app-token
+        if: env.APP_ID != ''
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.SIMP_APP_ID }}
+          private-key: ${{ secrets.SIMP_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: 'Assert a project-capable credential is available'
+        env:
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
+          PAT: ${{ secrets.SIMP_PROJECT_TOKEN }}
+        run: |
+          # shellcheck disable=SC2016
+          if [ -n "$APP_TOKEN" ]; then
+            echo 'Using the GitHub App installation token.'
+            echo 'If project writes fail with a permission error, the App needs'
+            echo 'Organization permissions -> Projects: Read and write.'
+          elif [ -n "$PAT" ]; then
+            printf '::warning ::Falling back to SIMP_PROJECT_TOKEN.\n'
+          else
+            printf '::error ::No project-capable credential available. Set '
+            printf 'SIMP_APP_ID + SIMP_APP_PRIVATE_KEY (with the org Projects '
+            printf 'permission), or SIMP_PROJECT_TOKEN.\n'
+            exit 1
+          fi
+
+      - name: 'Reconcile'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.SIMP_PROJECT_TOKEN }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          # shellcheck disable=SC2016
+          set -euo pipefail
+
+          # ---- field + option ids, resolved by name -------------------------
+          # shellcheck disable=SC2016
+          gh api graphql -f query='
+            query($org:String!,$num:Int!){
+              organization(login:$org){ projectV2(number:$num){
+                id
+                field(name:"Status"){ ... on ProjectV2SingleSelectField{
+                  id options{ id name } } } } } }' \
+            -F org="$ORG" -F num="$PROJECT_NUMBER" > meta.json
+
+          PROJECT_ID="$(jq -r '.data.organization.projectV2.id' meta.json)"
+          FIELD_ID="$(jq -r '.data.organization.projectV2.field.id' meta.json)"
+          # shellcheck disable=SC2016
+          jq -r '.data.organization.projectV2.field.options[]|[.name,.id]|@tsv' meta.json > options.tsv
+
+          opt() { awk -F'\t' -v n="$1" '$1==n{print $2}' options.tsv; }
+          for required in 'In Progress' 'In Review'; do
+            if [ -z "$(opt "$required")" ]; then
+              printf '::error ::Status option %s does not exist on the board.\n' "$required"
+              exit 1
+            fi
+          done
+
+          # ---- every item, with the live PR state ---------------------------
+          # shellcheck disable=SC2016
+          gh api graphql --paginate -f query='
+            query($org:String!,$num:Int!,$endCursor:String){
+              organization(login:$org){ projectV2(number:$num){
+                items(first:100, after:$endCursor){
+                  pageInfo{ hasNextPage endCursor }
+                  nodes{
+                    id
+                    fieldValueByName(name:"Status"){
+                      ... on ProjectV2ItemFieldSingleSelectValue{ name } }
+                    content{
+                      __typename
+                      ... on PullRequest{
+                        number isDraft reviewDecision authorAssociation state
+                        repository{ nameWithOwner }
+                        closingIssuesReferences(first:20){ nodes{ id } } }
+                      ... on Issue{
+                        id number state repository{ nameWithOwner } } } } } } } }' \
+            -F org="$ORG" -F num="$PROJECT_NUMBER" \
+            --jq '.data.organization.projectV2.items.nodes[]' | jq -s '.' > items.json
+
+          echo "board items: $(jq 'length' items.json)"
+
+          # ---- compute desired Status --------------------------------------
+          # Emits: itemId <TAB> label <TAB> current <TAB> desired
+          # shellcheck disable=SC2016
+          jq -r '
+            def member: IN("MEMBER","OWNER","COLLABORATOR");
+
+            ( [ .[] | select(.content.__typename == "PullRequest")
+                    | select(.content.state == "OPEN")
+                    | select(.content.authorAssociation | member)
+                    | .content.closingIssuesReferences.nodes[]?.id ]
+              | unique ) as $linked
+
+            | .[]
+            | . as $item
+            | ((.fieldValueByName.name) // "(none)") as $cur
+            | (.content.__typename) as $t
+            | (if $t == "PullRequest" then
+                   "\(.content.repository.nameWithOwner)#\(.content.number)"
+                 elif $t == "Issue" then
+                   "\(.content.repository.nameWithOwner)#\(.content.number)"
+                 else "draft-item" end) as $label
+            | (
+                if ($cur == "Blocked" or $cur == "Parked" or $cur == "Done") then null
+                elif $t == "PullRequest" then
+                  if (.content.state != "OPEN") then null
+                  elif (.content.authorAssociation | member | not) then null
+                  elif .content.isDraft then "In Progress"
+                  elif .content.reviewDecision == "CHANGES_REQUESTED" then "In Progress"
+                  else "In Review"
+                  end
+                elif $t == "Issue" then
+                  if (.content.state != "OPEN") then null
+                  elif (.content.id | IN($linked[])) then "In Progress"
+                  else null end
+                else null end
+              ) as $want
+            | select($want != null and $want != $cur)
+            | [$item.id, $label, $cur, $want] | @tsv
+          ' items.json > moves.tsv || true
+
+          moves="$(wc -l < moves.tsv | tr -d ' ')"
+          echo "moves required: ${moves}"
+
+          {
+            echo '## Board Status reconcile'
+            if [ "${DRY_RUN}" = 'true' ]; then echo '**Dry run — nothing changed.**'; fi
+            echo
+            if [ "${moves}" = '0' ]; then
+              echo 'Board already matches live PR state; no moves required.'
+            else
+              echo '| Item | From | To |'
+              echo '|---|---|---|'
+              awk -F'\t' '{printf "| %s | %s | %s |\n", $2, $3, $4}' moves.tsv
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${moves}" = '0' ] || [ "${DRY_RUN}" = 'true' ]; then
+            awk -F'\t' '{printf "  would move %-46s %s -> %s\n", $2, $3, $4}' moves.tsv
+            exit 0
+          fi
+
+          # ---- apply --------------------------------------------------------
+          applied=0; failed=0
+          while IFS=$'\t' read -r item_id label cur want; do
+            option_id="$(opt "$want")"
+            if [ -z "$option_id" ]; then
+              echo "::error ::${label}: no Status option named '${want}'"
+              failed=$((failed + 1)); continue
+            fi
+            # shellcheck disable=SC2016
+            if gh api graphql -f query='
+                  mutation($p:ID!,$i:ID!,$f:ID!,$o:String!){
+                    updateProjectV2ItemFieldValue(input:{
+                      projectId:$p, itemId:$i, fieldId:$f,
+                      value:{ singleSelectOptionId:$o } }){
+                      projectV2Item{ id } } }' \
+                  -F p="$PROJECT_ID" -F i="$item_id" -F f="$FIELD_ID" -F o="$option_id" \
+                  >/dev/null 2>&1; then
+              printf '  moved %-46s %s -> %s\n' "$label" "$cur" "$want"
+              applied=$((applied + 1))
+            else
+              echo "::error ::${label}: failed to set Status to ${want}"
+              failed=$((failed + 1))
+            fi
+          done < moves.tsv
+
+          echo "applied=${applied} failed=${failed}"
+          { echo; echo "**applied ${applied} · failed ${failed}**"; } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$failed" -gt 0 ]; then
+            printf '::error ::%s Status update(s) failed\n' "$failed"
+            exit 1
+          fi
