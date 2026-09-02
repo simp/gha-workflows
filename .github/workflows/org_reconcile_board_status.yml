@@ -155,18 +155,29 @@ jobs:
           }
 
           GH_TOKEN=''
-          if [ -n "${APP_TOKEN:-}" ] && probe "$APP_TOKEN"; then
-            echo 'Credential: GitHub App installation token.'
-            GH_TOKEN="$APP_TOKEN"
-          elif [ -n "${APP_TOKEN:-}" ] && [ -n "${PAT:-}" ] && probe "$PAT"; then
-            printf '::warning ::App token was refused by the project API; falling '
-            printf 'back to SIMP_PROJECT_TOKEN. Grant the App '
-            printf '"Organization permissions -> Projects: Read and write".\n'
+          app_refused='no'
+
+          if [ -n "${APP_TOKEN:-}" ]; then
+            if probe "$APP_TOKEN"; then
+              echo 'Credential: GitHub App installation token.'
+              GH_TOKEN="$APP_TOKEN"
+            else
+              app_refused='yes'
+            fi
+          fi
+
+          if [ -z "$GH_TOKEN" ] && [ -n "${PAT:-}" ] && probe "$PAT"; then
+            if [ "$app_refused" = 'yes' ]; then
+              printf '::warning ::App token was refused by the project API; falling '
+              printf 'back to SIMP_PROJECT_TOKEN. Grant the App '
+              printf '"Organization permissions -> Projects: Read and write".\n'
+            else
+              printf '::warning ::No App credential; using SIMP_PROJECT_TOKEN.\n'
+            fi
             GH_TOKEN="$PAT"
-          elif [ -n "${PAT:-}" ] && probe "$PAT"; then
-            printf '::warning ::No App credential; using SIMP_PROJECT_TOKEN.\n'
-            GH_TOKEN="$PAT"
-          else
+          fi
+
+          if [ -z "$GH_TOKEN" ]; then
             printf '::error ::No credential can read the org project. Grant the App '
             printf '"Organization permissions -> Projects: Read and write", or set '
             printf 'SIMP_PROJECT_TOKEN to a PAT with the project scope.\n'
@@ -193,9 +204,16 @@ jobs:
           # Destinations must exist, and so must the three names that STOP this
           # job from overriding human placements -- otherwise a column rename
           # silently disarms the guard instead of failing the run.
+          # Explicit if/fi rather than a `&&` list: the list form is actually
+          # safe under `set -e` (a failing command inside a && list is exempt,
+          # so the loop's non-zero status does not exit the shell), but it reads
+          # like a bug and would become one if a command were ever appended
+          # after it in the loop body.
           missing=''
           for required in 'In Progress' 'In Review' 'Blocked' 'Parked' 'Done'; do
-            [ -z "$(opt "$required")" ] && missing="${missing} '${required}'"
+            if [ -z "$(opt "$required")" ]; then
+              missing="${missing} '${required}'"
+            fi
           done
           if [ -n "$missing" ]; then
             printf '::error ::Status option(s) missing from the board:%s. Renaming a column changes this behaviour, so the job refuses to run.\n' \
@@ -294,7 +312,9 @@ jobs:
           # ---- apply ---------------------------------------------------------
           applied=0; failed=0
           : > failures.txt
-          while IFS=$'\t' read -r item_id label cur want; do
+          # Read on fd 3: nothing in this loop currently consumes stdin, but a
+          # command that did would silently swallow the remaining moves.
+          while IFS=$'\t' read -r item_id label cur want <&3; do
             option_id="$(opt "$want")"
             err=''
             # shellcheck disable=SC2016
@@ -331,7 +351,7 @@ jobs:
                   failed=$((failed + 1)) ;;
               esac
             fi
-          done < moves.tsv
+          done 3< moves.tsv
 
           echo "applied=${applied} failed=${failed}"
           {
