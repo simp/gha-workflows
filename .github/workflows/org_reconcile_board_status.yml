@@ -388,10 +388,23 @@ jobs:
           #
           # public_members is readable without any grant, so comparing the two
           # detects the condition. Assumes the org has at least one private
-          # member -- true here, and if that ever stops being true this check
-          # fails closed rather than open.
-          public_count="$(gh api "orgs/${ORG}/public_members" --paginate --jq '.[].login' \
-                          2>/dev/null | sort -u | grep -c . || echo 0)"
+          # member -- true here (20 of 32), and if that ever stops being true
+          # this check aborts a healthy run rather than passing a broken one.
+          # Read into a file and count separately, rather than
+          # `... | grep -c . || echo 0`. That idiom fails OPEN: `grep -c` prints
+          # 0 and *then* exits 1 on no match, so `|| echo 0` appends a second
+          # line, `public_count` becomes "0\n0", the comparison below dies with
+          # "integer expression expected" and returns 2 -- which inside an `if`
+          # counts as false and is exempt from `set -e`. The guard is skipped and
+          # the run proceeds on a partial member list. Same shape when the API
+          # call itself fails under `pipefail`.
+          if ! gh api "orgs/${ORG}/public_members" --paginate --jq '.[].login' \
+                 > public_members.txt 2> public_members_err.txt; then
+            printf '::error ::Could not read the public organization member list, which this job needs in order to tell a partial member list from a complete one. Refusing to proceed.\n'
+            sed -e 's/^/::error ::  /' public_members_err.txt | head -5 || true
+            exit 1
+          fi
+          public_count="$(sort -u public_members.txt | wc -l | tr -d ' ')"
           echo "org members: ${member_count} resolved, ${public_count} publicly visible"
 
           if [ "$member_count" -le "$public_count" ]; then
