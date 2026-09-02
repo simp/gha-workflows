@@ -222,8 +222,11 @@ jobs:
           fi
 
           # ---- every item, with live PR state --------------------------------
+          # Fetched raw rather than through --jq: a partially-authorised response
+          # carries a top-level `errors` array alongside the data, and piping
+          # through --jq would discard it.
           # shellcheck disable=SC2016
-          gh api graphql --paginate -f query='
+          if ! gh api graphql --paginate -f query='
             query($org:String!,$num:Int!,$endCursor:String){
               organization(login:$org){ projectV2(number:$num){
                 items(first:100, after:$endCursor){
@@ -234,6 +237,7 @@ jobs:
                       ... on ProjectV2ItemFieldSingleSelectValue{ name } }
                     content{
                       __typename
+                      ... on DraftIssue{ title }
                       ... on PullRequest{
                         number isDraft reviewDecision authorAssociation state
                         repository{ nameWithOwner } }
@@ -241,10 +245,57 @@ jobs:
                         number state repository{ nameWithOwner }
                         closedByPullRequestsReferences(first:20, includeClosedPrs:false){
                           nodes{ number state authorAssociation } } } } } } } } }' \
-            -f org="$ORG" -F num="$PROJECT_NUMBER" \
-            --jq '.data.organization.projectV2.items.nodes[]' | jq -s '.' > items.json
+            -f org="$ORG" -F num="$PROJECT_NUMBER" > raw.json; then
+            printf '::error ::Could not read the project items.\n'
+            exit 1
+          fi
 
-          echo "board items: $(jq 'length' items.json)"
+          gql_errors="$(jq -s '[.[].errors // []] | flatten | length' raw.json)"
+          if [ "$gql_errors" -gt 0 ]; then
+            printf '::error ::The items query returned %s GraphQL error(s); the board\n' \
+              "$gql_errors"
+            printf '::error ::view is incomplete, so reconciling it would be wrong.\n'
+            jq -rs '[.[].errors // []] | flatten | .[0:5][]
+                    | "::error ::  " + (.message // "unknown error")' raw.json
+            exit 1
+          fi
+
+          jq -s '[.[].data.organization.projectV2.items.nodes[]]' raw.json > items.json
+          total="$(jq 'length' items.json)"
+
+          # Items whose content the credential cannot read. Without this check
+          # they fall through as "no opinion" and are silently skipped: a run
+          # seeing a fraction of the board would apply a fraction of the moves
+          # and still report success.
+          #
+          # DraftIssue items legitimately have no issue/PR behind them and are
+          # not counted -- they are simply never moved.
+          unreadable="$(jq '[ .[]
+            | select(.content == null
+                     or ((.content.__typename == "Issue"
+                          or .content.__typename == "PullRequest")
+                         and .content.state == null)) ] | length' items.json)"
+          drafts="$(jq '[ .[] | select(.content.__typename == "DraftIssue") ] | length' items.json)"
+
+          echo "board items: ${total} (draft items: ${drafts}, unreadable: ${unreadable})"
+
+          if [ "$unreadable" -gt 0 ]; then
+            printf '::error ::%s of %s board items could not be read, so the board view is incomplete. The credential needs Repository permissions -> "Issues: Read" and "Pull requests: Read". Refusing to reconcile a partial view.\n' \
+              "$unreadable" "$total"
+            {
+              echo '## Board Status reconcile'
+              echo
+              echo "**Aborted: ${unreadable} of ${total} items could not be read.**"
+              echo
+              echo 'The credential can see the project but not the issues and pull'
+              echo 'requests behind its items. Grant the App **Repository'
+              echo 'permissions -> Issues: Read** and **Pull requests: Read**.'
+              echo
+              echo 'Reconciling a partial view would apply some moves, skip the'
+              echo 'rest silently, and report success.'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
 
           # ---- compute desired Status ---------------------------------------
           # No `|| true` here: jq exits non-zero only on real breakage, and
