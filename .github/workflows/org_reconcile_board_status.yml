@@ -19,7 +19,19 @@
 #   Issue with an open member PR that closes it ..... In Progress
 #   Anything authored from outside the org .......... UNTOUCHED
 #
-# "Member" means authorAssociation in MEMBER / OWNER / COLLABORATOR.
+# "Member" means the author's login appears in the organization's member list,
+# which is fetched once per run. It deliberately does NOT use the PR's
+# `authorAssociation` field: that is credential-dependent, and an App
+# installation token reading a public repo gets the same degraded answer as an
+# anonymous client. Verified on simp/pupmod-simp-ssh#229 -- a user PAT reports
+# MEMBER while both an App token and an unauthenticated request report
+# CONTRIBUTOR. Trusting it made the mapping treat 29 org members as outside
+# contributors and skip them, silently doing about a third of its work.
+#
+# One intentional narrowing comes with this: an outside collaborator on a single
+# repo who is not an org member now counts as an outside contribution. That
+# matches the rule we actually want ("is this one of us?") rather than the
+# repo-scoped relationship authorAssociation described.
 #
 # Outside contributions are left alone deliberately. Marking a drive-by draft
 # "In Progress" would imply *we* are working it, and would drop it out of the
@@ -85,6 +97,7 @@
 #     Repository permissions   -> Metadata: Read
 #     Repository permissions   -> Issues: Read
 #     Repository permissions   -> Pull requests: Read
+#     Organization permissions -> Members: Read
 #     Organization permissions -> Projects: Read and write
 #
 # ...and an installation covering every repository represented on the board.
@@ -264,12 +277,13 @@ jobs:
                       __typename
                       ... on DraftIssue{ title }
                       ... on PullRequest{
-                        number isDraft reviewDecision authorAssociation state
+                        number isDraft reviewDecision state
+                        author{ login }
                         repository{ nameWithOwner } }
                       ... on Issue{
                         number state repository{ nameWithOwner }
                         closedByPullRequestsReferences(first:20, includeClosedPrs:false){
-                          nodes{ number state authorAssociation } } } } } } } } }' \
+                          nodes{ number state author{ login } } } } } } } } }' \
             -f org="$ORG" -F num="$PROJECT_NUMBER" > raw.json 2> gh_stderr.txt; then
 
             gql_errors="$(jq -s '[.[].errors // []] | flatten | length' raw.json 2>/dev/null || echo 0)"
@@ -325,18 +339,51 @@ jobs:
 
           echo "board items: ${total} (readable ${readable}, draft ${drafts}, unreadable ${unreadable}, gone ${gone}, unknown ${unknown})"
 
-          # Field-level visibility. `content` being readable is necessary but not
-          # sufficient: the mapping also needs authorAssociation, isDraft and
-          # reviewDecision, and a credential can resolve the content object while
-          # returning a degraded value for one of those. Logging the distribution
-          # makes that visible instead of showing up as unexplained missing moves.
-          echo "open PR authorAssociation as this credential sees it:"
-          jq -r '[ .[] | select(.content != null)
-                       | select(.content.__typename == "PullRequest")
-                       | select(.content.state == "OPEN")
-                       | (.content.authorAssociation // "(null)") ]
-                 | group_by(.) | map({a: .[0], n: length}) | .[]
-                 | "  \(.a): \(.n)"' items.json
+          # ---- resolve org membership authoritatively -------------------------
+          # NOT via authorAssociation: that field is credential-dependent. An App
+          # installation token reading a public repo gets the same degraded answer
+          # as an anonymous client -- verified on simp/pupmod-simp-ssh#229, where a
+          # user PAT reports MEMBER and both an App token and an unauthenticated
+          # request report CONTRIBUTOR. Trusting it made the mapping treat 29 org
+          # members as outside contributors and silently skip them.
+          #
+          # Needs Organization permissions -> Members: Read.
+          # shellcheck disable=SC2016
+          if ! gh api graphql --paginate -f query='
+            query($org:String!,$endCursor:String){
+              organization(login:$org){
+                membersWithRole(first:100, after:$endCursor){
+                  pageInfo{ hasNextPage endCursor }
+                  nodes{ login } } } }' \
+            -f org="$ORG" > members_raw.json 2> members_err.txt; then
+            printf '::error ::Could not read the organization member list, which this job needs to tell members from outside contributors. Grant the App Organization permissions -> "Members: Read".\n'
+            sed -e 's/^/::error ::  /' members_err.txt | head -5 || true
+            exit 1
+          fi
+
+          jq -s '[ .[] | (.data.organization.membersWithRole.nodes // [])[].login ] | unique' \
+            members_raw.json > members.json
+          member_count="$(jq 'length' members.json)"
+          echo "org members resolved: ${member_count}"
+
+          # An empty list is the dangerous case: every author would look like an
+          # outside contributor, the mapping would skip all of them, and the run
+          # would report success having done nothing. Fail instead.
+          if [ "$member_count" -eq 0 ]; then
+            printf '::error ::The organization member list came back empty. Every author would then look like an outside contributor and be skipped, so this run would do nothing and still report success. Grant the App Organization permissions -> "Members: Read".\n'
+            exit 1
+          fi
+
+          echo "open PR authors, by membership:"
+          jq -r --slurpfile M members.json '
+            ($M[0]) as $members
+            | [ .[] | select(.content != null)
+                    | select(.content.__typename == "PullRequest")
+                    | select(.content.state == "OPEN")
+                    | (if ([.content.author.login] | inside($members))
+                       then "member" else "outside" end) ]
+            | group_by(.) | map({k: .[0], n: length}) | .[]
+            | "  \(.k): \(.n)"' items.json
 
           if [ "$((readable + drafts + gone + unreadable + unknown))" -ne "$total" ]; then
             printf '::error ::Item classification does not account for all %s items; refusing to proceed.\n' "$total"
@@ -396,8 +443,9 @@ jobs:
           # swallowing that would leave moves.tsv empty and report "nothing to
           # do" every hour, forever.
           # shellcheck disable=SC2016
-          jq -r '
-            def member: IN("MEMBER","OWNER","COLLABORATOR");
+          jq -r --slurpfile M members.json '
+            ($M[0]) as $members
+            | def member($login): ($login != null) and ([$login] | inside($members));
 
             .[]
             | . as $item
@@ -414,7 +462,7 @@ jobs:
 
                 elif $t == "PullRequest" then
                   if (.content.state != "OPEN") then null
-                  elif ((.content.authorAssociation | member) | not) then null
+                  elif ((member(.content.author.login)) | not) then null
                   elif .content.isDraft then "In Progress"
                   elif (.content.reviewDecision == "CHANGES_REQUESTED") then "In Progress"
                   else "In Review"
@@ -424,7 +472,7 @@ jobs:
                   if (.content.state != "OPEN") then null
                   elif ([ .content.closedByPullRequestsReferences.nodes[]?
                           | select(.state == "OPEN")
-                          | select(.authorAssociation | member) ] | length) > 0
+                          | select(member(.author.login)) ] | length) > 0
                   then "In Progress"
                   else null   # one-way: never demote. See header.
                   end
