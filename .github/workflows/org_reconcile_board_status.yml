@@ -72,13 +72,24 @@
 # ==============================================================================
 # Credential
 #
-# Prefers the org-owned GitHub App, which needs BOTH:
+# Prefers the org-owned GitHub App, which needs ALL of:
 #
 #     Repository permissions   -> Metadata: Read
+#     Repository permissions   -> Issues: Read
+#     Repository permissions   -> Pull requests: Read
 #     Organization permissions -> Projects: Read and write
 #
+# ...and an installation covering every repository represented on the board.
+#
+# The Projects grant alone is not enough: it lets the App read the project and
+# write Status, but the mapping is computed from the issues and pull requests
+# behind the cards. Without Issues/Pull requests read, `content` comes back null
+# for those items, the App passes the probe, and the run aborts on the
+# classification guard below -- which is exactly what the first live dry run
+# did, proposing 13 moves where a full-read credential computes 44.
+#
 # The triage board is an *organization* project, so repository permissions alone
-# are not enough. The App token is **probed** against the project before use; if
+# are not enough either. The App token is **probed** against the project before use; if
 # the probe fails the job falls back to SIMP_PROJECT_TOKEN (a PAT with the
 # project scope). Probing matters because an App token that exists but is
 # refused would otherwise abort the run on its first read, with a usable PAT
@@ -335,7 +346,7 @@ jobs:
             else
               printf '::error ::Running as SIMP_PROJECT_TOKEN: that PAT needs read access to the repositories behind these items.\n'
             fi
-            awk -F'\t' '$1=="unreadable"{printf "::error ::  %s (type=%s)\n", $3, $2}' classes.tsv | head -20
+            awk -F'\t' '$1=="unreadable"{printf "::error ::  %s (type=%s)\n", $3, $2}' classes.tsv | head -20 || true
             {
               echo '## Board Status reconcile'
               echo
