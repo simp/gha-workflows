@@ -41,6 +41,11 @@
 # * Touch any field other than Status.
 # * Revert an issue it previously promoted. **Issue promotion is one-way** —
 #   see the note below.
+# * Move anything to `Done`, or reconcile a PR once it is no longer open. That
+#   is handled by the board's built-in **"Pull request merged"** and **"Item
+#   closed"** workflows, both currently enabled. Those two are load-bearing: if
+#   they are ever disabled, merged PRs will accumulate in `In Review` and this
+#   job will not clear them.
 #
 # Status option IDs are looked up **by name at run time**. Adding or renaming a
 # column mints new option IDs, so hardcoding them would break silently.
@@ -74,9 +79,14 @@
 #
 # The triage board is an *organization* project, so repository permissions alone
 # are not enough. The App token is **probed** against the project before use; if
-# the probe fails the job falls back to SIMP_PROJECT_TOKEN (a PAT with `project`
-# scope). Probing matters because an App token that exists but is refused would
-# otherwise abort the run on its first read, with a usable PAT sitting unused.
+# the probe fails the job falls back to SIMP_PROJECT_TOKEN (a PAT with the
+# project scope). Probing matters because an App token that exists but is
+# refused would otherwise abort the run on its first read, with a usable PAT
+# sitting unused.
+#
+# Note the probe is a **read**: an App granted only `Projects: Read` passes it
+# and then fails on the first mutation, which is treated as systemic and aborts
+# the run. Read/write is therefore the requirement, not merely read.
 #
 ---
 name: 'ORG: Reconcile triage board Status'
@@ -137,8 +147,11 @@ jobs:
 
           # ---- pick a credential that actually works ------------------------
           probe() {
+            # -f (not -F) for string variables: gh's -F coerces all-digit
+            # values to JSON numbers, and single-select option IDs are 8-char
+            # hex, so ~2% of them are all digits. $num is genuinely Int!.
             GH_TOKEN="$1" gh api graphql -f query="$META_QUERY" \
-              -F org="$ORG" -F num="$PROJECT_NUMBER" > meta.json 2>/dev/null
+              -f org="$ORG" -F num="$PROJECT_NUMBER" > meta.json 2>/dev/null
           }
 
           GH_TOKEN=''
@@ -162,7 +175,17 @@ jobs:
           export GH_TOKEN
 
           PROJECT_ID="$(jq -r '.data.organization.projectV2.id' meta.json)"
-          FIELD_ID="$(jq -r '.data.organization.projectV2.field.id' meta.json)"
+          FIELD_ID="$(jq -r '.data.organization.projectV2.field.id // ""' meta.json)"
+
+          # Guard the field itself, not only its options: if Status is renamed or
+          # is no longer a single-select, field(name:"Status") is null and the
+          # options iteration below would die with an unexplained jq error.
+          if [ -z "$FIELD_ID" ] || [ "$FIELD_ID" = 'null' ]; then
+            printf '::error ::The project has no single-select field named "Status". '
+            printf 'This job keys every decision off that field, so it refuses to run.\n'
+            exit 1
+          fi
+
           jq -r '.data.organization.projectV2.field.options[]|[.name,.id]|@tsv' meta.json > options.tsv
 
           opt() { awk -F'\t' -v n="$1" '$1==n{print $2}' options.tsv; }
@@ -200,7 +223,7 @@ jobs:
                         number state repository{ nameWithOwner }
                         closedByPullRequestsReferences(first:20, includeClosedPrs:false){
                           nodes{ number state authorAssociation } } } } } } } } }' \
-            -F org="$ORG" -F num="$PROJECT_NUMBER" \
+            -f org="$ORG" -F num="$PROJECT_NUMBER" \
             --jq '.data.organization.projectV2.items.nodes[]' | jq -s '.' > items.json
 
           echo "board items: $(jq 'length' items.json)"
@@ -281,7 +304,7 @@ jobs:
                       projectId:$p, itemId:$i, fieldId:$f,
                       value:{ singleSelectOptionId:$o } }){
                       projectV2Item{ id } } }' \
-                  -F p="$PROJECT_ID" -F i="$item_id" -F f="$FIELD_ID" -F o="$option_id" \
+                  -f p="$PROJECT_ID" -f i="$item_id" -f f="$FIELD_ID" -f o="$option_id" \
                   2>&1 >/dev/null)"; then
               printf '  moved %-46s %s -> %s\n' "$label" "$cur" "$want"
               applied=$((applied + 1))
@@ -295,8 +318,11 @@ jobs:
                     "$label" "$trimmed"
                   printf '::error ::Aborting after the first permission failure. Grant the '
                   printf 'App "Organization permissions -> Projects: Read and write".\n'
-                  { echo; echo "**aborted: credential cannot write the project**"; } \
-                    >> "$GITHUB_STEP_SUMMARY"
+                  { echo
+                    echo "**Aborted before any move was applied** — the credential"
+                    echo "cannot write the org project. None of the moves listed"
+                    echo "above were made."
+                  } >> "$GITHUB_STEP_SUMMARY"
                   exit 1 ;;
                 *)
                   printf '::error ::%s: failed to set Status to %s: %s\n' \
