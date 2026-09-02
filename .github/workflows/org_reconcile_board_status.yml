@@ -317,6 +317,19 @@ jobs:
 
           echo "board items: ${total} (readable ${readable}, draft ${drafts}, redacted ${redacted}, unreadable ${unreadable}, unknown ${unknown})"
 
+          # Field-level visibility. `content` being readable is necessary but not
+          # sufficient: the mapping also needs authorAssociation, isDraft and
+          # reviewDecision, and a credential can resolve the content object while
+          # returning a degraded value for one of those. Logging the distribution
+          # makes that visible instead of showing up as unexplained missing moves.
+          echo "open PR authorAssociation as this credential sees it:"
+          jq -r '[ .[] | select(.content != null)
+                       | select(.content.__typename == "PullRequest")
+                       | select(.content.state == "OPEN")
+                       | (.content.authorAssociation // "(null)") ]
+                 | group_by(.) | map({a: .[0], n: length}) | .[]
+                 | "  \(.a): \(.n)"' items.json
+
           if [ "$((readable + drafts + redacted + unreadable + unknown))" -ne "$total" ]; then
             printf '::error ::Item classification does not account for all %s items; refusing to proceed.\n' "$total"
             exit 1
