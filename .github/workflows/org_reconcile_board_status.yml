@@ -155,12 +155,14 @@ jobs:
           }
 
           GH_TOKEN=''
+          CREDENTIAL=''
           app_refused='no'
 
           if [ -n "${APP_TOKEN:-}" ]; then
             if probe "$APP_TOKEN"; then
               echo 'Credential: GitHub App installation token.'
               GH_TOKEN="$APP_TOKEN"
+              CREDENTIAL='app'
             else
               app_refused='yes'
             fi
@@ -175,6 +177,7 @@ jobs:
               printf '::warning ::No App credential; using SIMP_PROJECT_TOKEN.\n'
             fi
             GH_TOKEN="$PAT"
+            CREDENTIAL='pat'
           fi
 
           if [ -z "$GH_TOKEN" ]; then
@@ -183,7 +186,7 @@ jobs:
             printf 'SIMP_PROJECT_TOKEN to a PAT with the project scope.\n'
             exit 1
           fi
-          export GH_TOKEN
+          export GH_TOKEN CREDENTIAL
 
           PROJECT_ID="$(jq -r '.data.organization.projectV2.id' meta.json)"
           FIELD_ID="$(jq -r '.data.organization.projectV2.field.id // ""' meta.json)"
@@ -222,9 +225,11 @@ jobs:
           fi
 
           # ---- every item, with live PR state --------------------------------
-          # Fetched raw rather than through --jq: a partially-authorised response
-          # carries a top-level `errors` array alongside the data, and piping
-          # through --jq would discard it.
+          # Fetched raw rather than through --jq so the response body is on disk
+          # when things go wrong. `gh api graphql` exits non-zero whenever the
+          # body carries a top-level `errors` array -- even on HTTP 200 with
+          # partial `data` -- but it writes the body to stdout *before* failing,
+          # so raw.json still holds the detail we want to report.
           # shellcheck disable=SC2016
           if ! gh api graphql --paginate -f query='
             query($org:String!,$num:Int!,$endCursor:String){
@@ -233,6 +238,7 @@ jobs:
                   pageInfo{ hasNextPage endCursor }
                   nodes{
                     id
+                    type
                     fieldValueByName(name:"Status"){
                       ... on ProjectV2ItemFieldSingleSelectValue{ name } }
                     content{
@@ -245,51 +251,105 @@ jobs:
                         number state repository{ nameWithOwner }
                         closedByPullRequestsReferences(first:20, includeClosedPrs:false){
                           nodes{ number state authorAssociation } } } } } } } } }' \
-            -f org="$ORG" -F num="$PROJECT_NUMBER" > raw.json; then
-            printf '::error ::Could not read the project items.\n'
+            -f org="$ORG" -F num="$PROJECT_NUMBER" > raw.json 2> gh_stderr.txt; then
+
+            gql_errors="$(jq -s '[.[].errors // []] | flatten | length' raw.json 2>/dev/null || echo 0)"
+            if [ "$gql_errors" -gt 0 ]; then
+              printf '::error ::The items query returned %s GraphQL error(s), so the board view is incomplete. Refusing to reconcile a partial view.\n' \
+                "$gql_errors"
+              jq -rs '[.[].errors // []] | flatten | .[0:5][]
+                      | "::error ::  " + (.message // "unknown error")' raw.json || true
+            else
+              printf '::error ::Could not read the project items.\n'
+              sed -e 's/^/::error ::  /' gh_stderr.txt | head -5 || true
+            fi
             exit 1
           fi
 
-          gql_errors="$(jq -s '[.[].errors // []] | flatten | length' raw.json)"
-          if [ "$gql_errors" -gt 0 ]; then
-            printf '::error ::The items query returned %s GraphQL error(s); the board\n' \
-              "$gql_errors"
-            printf '::error ::view is incomplete, so reconciling it would be wrong.\n'
-            jq -rs '[.[].errors // []] | flatten | .[0:5][]
-                    | "::error ::  " + (.message // "unknown error")' raw.json
-            exit 1
-          fi
-
-          jq -s '[.[].data.organization.projectV2.items.nodes[]]' raw.json > items.json
+          # `// []` guards the rare `data: null` page: without it jq exits 5 with
+          # a bare "Cannot iterate over null" and no annotation, unlike every
+          # other failure path here.
+          jq -s '[ .[] | (.data.organization.projectV2.items.nodes // [])[] ]' raw.json > items.json
           total="$(jq 'length' items.json)"
 
-          # Items whose content the credential cannot read. Without this check
-          # they fall through as "no opinion" and are silently skipped: a run
-          # seeing a fraction of the board would apply a fraction of the moves
-          # and still report success.
-          #
-          # DraftIssue items legitimately have no issue/PR behind them and are
-          # not counted -- they are simply never moved.
-          unreadable="$(jq '[ .[]
-            | select(.content == null
-                     or ((.content.__typename == "Issue"
-                          or .content.__typename == "PullRequest")
-                         and .content.state == null)) ] | length' items.json)"
-          drafts="$(jq '[ .[] | select(.content.__typename == "DraftIssue") ] | length' items.json)"
+          if [ "$total" -eq 0 ]; then
+            printf '::error ::The project returned no items. That is never correct for this board, so the response is being treated as unusable rather than as an empty board.\n'
+            exit 1
+          fi
 
-          echo "board items: ${total} (draft items: ${drafts}, unreadable: ${unreadable})"
+          # ---- classify every item positively -------------------------------
+          # A negative "is it broken?" test leaves anything matching neither
+          # branch invisible to both this guard and the mapping below -- the same
+          # silent-skip shape this guard exists to close. So every item is put in
+          # exactly one bucket, and the buckets are asserted to sum to the total.
+          #
+          # ProjectV2Item.type is always present (ISSUE, PULL_REQUEST,
+          # DRAFT_ISSUE, REDACTED), which makes it a safer discriminator than
+          # content, which is null precisely when we cannot see it.
+          jq -r '
+            [ .[]
+              | { id,
+                  t: .type,
+                  cls: (
+                    if   .type == "DRAFT_ISSUE" then "draft"
+                    elif .type == "REDACTED"    then "redacted"
+                    elif (.type == "ISSUE" or .type == "PULL_REQUEST") then
+                      (if .content == null then "unreadable" else "readable" end)
+                    else "unknown" end ) } ]
+            | .[] | [.cls, .t, .id] | @tsv
+          ' items.json > classes.tsv
+
+          count() { awk -F'\t' -v c="$1" '$1==c{n++} END{print n+0}' classes.tsv; }
+          drafts="$(count draft)";     redacted="$(count redacted)"
+          readable="$(count readable)"; unreadable="$(count unreadable)"
+          unknown="$(count unknown)"
+
+          echo "board items: ${total} (readable ${readable}, draft ${drafts}, redacted ${redacted}, unreadable ${unreadable}, unknown ${unknown})"
+
+          if [ "$((readable + drafts + redacted + unreadable + unknown))" -ne "$total" ]; then
+            printf '::error ::Item classification does not account for all %s items; refusing to proceed.\n' "$total"
+            exit 1
+          fi
+
+          if [ "$unknown" -gt 0 ]; then
+            printf '::error ::%s item(s) have a ProjectV2Item.type this workflow does not know how to classify. Refusing to reconcile, because an unclassified item would be skipped silently.\n' \
+              "$unknown"
+            awk -F'\t' '$1=="unknown"{printf "::error ::  %s (type=%s)\n", $3, $2}' classes.tsv
+            exit 1
+          fi
+
+          # REDACTED content is not a permission problem and no grant fixes it,
+          # so it is reported loudly and skipped rather than blocking every
+          # future run. (A redacted card would otherwise deadlock the board.)
+          if [ "$redacted" -gt 0 ]; then
+            printf '::warning ::%s board item(s) are REDACTED -- their content is permanently invisible. They are skipped; remove the cards to silence this.\n' \
+              "$redacted"
+            awk -F'\t' '$1=="redacted"{printf "::warning ::  %s\n", $3}' classes.tsv
+          fi
 
           if [ "$unreadable" -gt 0 ]; then
-            printf '::error ::%s of %s board items could not be read, so the board view is incomplete. The credential needs Repository permissions -> "Issues: Read" and "Pull requests: Read". Refusing to reconcile a partial view.\n' \
+            printf '::error ::%s of %s board items are issues or pull requests whose content could not be read, so the board view is incomplete. Refusing to reconcile a partial view.\n' \
               "$unreadable" "$total"
+            if [ "$CREDENTIAL" = 'app' ]; then
+              printf '::error ::Running as the GitHub App: grant it Repository permissions -> "Issues: Read" and "Pull requests: Read", and check the installation covers every repo on the board.\n'
+            else
+              printf '::error ::Running as SIMP_PROJECT_TOKEN: that PAT needs read access to the repositories behind these items.\n'
+            fi
+            awk -F'\t' '$1=="unreadable"{printf "::error ::  %s (type=%s)\n", $3, $2}' classes.tsv | head -20
             {
               echo '## Board Status reconcile'
               echo
               echo "**Aborted: ${unreadable} of ${total} items could not be read.**"
               echo
-              echo 'The credential can see the project but not the issues and pull'
-              echo 'requests behind its items. Grant the App **Repository'
-              echo 'permissions -> Issues: Read** and **Pull requests: Read**.'
+              if [ "$CREDENTIAL" = 'app' ]; then
+                echo 'Running as the **GitHub App**. Grant it **Repository'
+                echo 'permissions -> Issues: Read** and **Pull requests: Read**,'
+                echo 'and confirm the installation covers every repo on the board.'
+              else
+                echo 'Running as **SIMP_PROJECT_TOKEN**. That PAT needs read access'
+                echo 'to the repositories behind these items; granting App'
+                echo 'permissions will not change this run.'
+              fi
               echo
               echo 'Reconciling a partial view would apply some moves, skip the'
               echo 'rest silently, and report success.'
@@ -311,7 +371,9 @@ jobs:
             | (.content.__typename) as $t
             | (if ($t == "PullRequest" or $t == "Issue")
                then "\(.content.repository.nameWithOwner)#\(.content.number)"
-               else "draft-item" end) as $label
+               elif ($t == "DraftIssue")
+               then "draft: \(.content.title)"
+               else "item \($item.id)" end) as $label
             | (
                 # Never override a deliberate human placement.
                 if ($cur == "Blocked" or $cur == "Parked" or $cur == "Done") then null
