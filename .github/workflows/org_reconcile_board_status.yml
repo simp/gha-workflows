@@ -366,11 +366,47 @@ jobs:
           member_count="$(jq 'length' members.json)"
           echo "org members resolved: ${member_count}"
 
-          # An empty list is the dangerous case: every author would look like an
-          # outside contributor, every move would be skipped, and the run would
-          # report success having done nothing.
+          # An empty list is the obvious dangerous case: every author would look
+          # like an outside contributor, every move would be skipped, and the run
+          # would report success having done nothing.
           if [ "$member_count" -eq 0 ]; then
             printf '::error ::The organization member list came back empty. Every author would then look like an outside contributor and be skipped, so this run would do nothing and still report success. Grant the credential Organization permissions -> "Members: Read".\n'
+            exit 1
+          fi
+
+          # The subtler and more likely case: a *partial* list. Without
+          # Members: Read, membersWithRole still succeeds -- it just returns only
+          # the publicly-visible members, with no error and a non-zero count. A
+          # count-above-zero check sails straight through it, and the private
+          # members' pull requests get silently classified as outside
+          # contributions.
+          #
+          # This is not hypothetical for simp: 12 of 32 members are public, and
+          # two of the most prolific board authors are private members. A
+          # credential lacking the grant would therefore resolve 12, skip the
+          # other 20's work, and report success.
+          #
+          # public_members is readable without any grant, so comparing the two
+          # detects the condition. Assumes the org has at least one private
+          # member -- true here, and if that ever stops being true this check
+          # fails closed rather than open.
+          public_count="$(gh api "orgs/${ORG}/public_members" --paginate --jq '.[].login' \
+                          2>/dev/null | sort -u | grep -c . || echo 0)"
+          echo "org members: ${member_count} resolved, ${public_count} publicly visible"
+
+          if [ "$member_count" -le "$public_count" ]; then
+            printf '::error ::Resolved %s org member(s) but %s are publicly visible, so this credential appears to see only public members. Private members would be misclassified as outside contributors and their work skipped silently. Grant the credential Organization permissions -> "Members: Read".\n' \
+              "$member_count" "$public_count"
+            {
+              echo '## Board Status reconcile'
+              echo
+              echo "**Aborted: the credential cannot see private org members.**"
+              echo
+              echo "Resolved ${member_count} members, of which ${public_count} are"
+              echo 'public. Without **Organization permissions -> Members: Read**,'
+              echo 'private members are indistinguishable from outside contributors,'
+              echo 'and their pull requests would be skipped with no error.'
+            } >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
 
