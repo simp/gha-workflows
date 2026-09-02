@@ -41,6 +41,14 @@
 # * Touch any field other than Status.
 # * Revert an issue it previously promoted. **Issue promotion is one-way** —
 #   see the note below.
+# * Reconcile an item the credential cannot view. The API reports those with
+#   `type: REDACTED` ("A project may contain items that a user does not have
+#   permission to view"), which is a *permission* signal: the run aborts on it,
+#   because a partial view would apply some moves and skip the rest in silence.
+#   Content that is genuinely gone (deleted, or moved out of the installation's
+#   reach) shows as a readable type with null content instead, and is warned
+#   about and skipped -- no grant recovers it, so aborting would deadlock the
+#   board.
 # * Move anything to `Done`, or reconcile a PR once it is no longer open. That
 #   is handled by the board's built-in **"Pull request merged"** and **"Item
 #   closed"** workflows, both currently enabled. Those two are load-bearing: if
@@ -311,11 +319,11 @@ jobs:
           ' items.json > classes.tsv
 
           count() { awk -F'\t' -v c="$1" '$1==c{n++} END{print n+0}' classes.tsv; }
-          drafts="$(count draft)";     redacted="$(count redacted)"
+          drafts="$(count draft)";     gone="$(count gone)"
           readable="$(count readable)"; unreadable="$(count unreadable)"
           unknown="$(count unknown)"
 
-          echo "board items: ${total} (readable ${readable}, draft ${drafts}, redacted ${redacted}, unreadable ${unreadable}, unknown ${unknown})"
+          echo "board items: ${total} (readable ${readable}, draft ${drafts}, unreadable ${unreadable}, gone ${gone}, unknown ${unknown})"
 
           # Field-level visibility. `content` being readable is necessary but not
           # sufficient: the mapping also needs authorAssociation, isDraft and
@@ -330,7 +338,7 @@ jobs:
                  | group_by(.) | map({a: .[0], n: length}) | .[]
                  | "  \(.a): \(.n)"' items.json
 
-          if [ "$((readable + drafts + redacted + unreadable + unknown))" -ne "$total" ]; then
+          if [ "$((readable + drafts + gone + unreadable + unknown))" -ne "$total" ]; then
             printf '::error ::Item classification does not account for all %s items; refusing to proceed.\n' "$total"
             exit 1
           fi
@@ -342,24 +350,26 @@ jobs:
             exit 1
           fi
 
-          # REDACTED content is not a permission problem and no grant fixes it,
-          # so it is reported loudly and skipped rather than blocking every
-          # future run. (A redacted card would otherwise deadlock the board.)
-          if [ "$redacted" -gt 0 ]; then
-            printf '::warning ::%s board item(s) are REDACTED -- their content is permanently invisible. They are skipped; remove the cards to silence this.\n' \
-              "$redacted"
-            awk -F'\t' '$1=="redacted"{printf "::warning ::  %s\n", $3}' classes.tsv
+          # An ISSUE/PULL_REQUEST item whose content is null despite a readable
+          # type is content that is genuinely gone -- deleted, or transferred
+          # somewhere the installation no longer reaches. No permission grant
+          # fixes that, so it is reported loudly and skipped: aborting would
+          # deadlock the board until a human found and removed the card.
+          if [ "$gone" -gt 0 ]; then
+            printf '::warning ::%s board item(s) reference content that no longer resolves (deleted, or moved out of reach). They are skipped -- no permission grant will recover them, so remove the cards to silence this.\n' \
+              "$gone"
+            awk -F'\t' '$1=="gone"{printf "::warning ::  %s (type=%s)\n", $3, $2}' classes.tsv | head -20 || true
           fi
 
           if [ "$unreadable" -gt 0 ]; then
-            printf '::error ::%s of %s board items are issues or pull requests whose content could not be read, so the board view is incomplete. Refusing to reconcile a partial view.\n' \
+            printf '::error ::%s of %s board items came back REDACTED, which is how the API reports an item the credential is not allowed to view. The board view is incomplete, so reconciling it would apply some moves and skip the rest silently.\n' \
               "$unreadable" "$total"
             if [ "$CREDENTIAL" = 'app' ]; then
               printf '::error ::Running as the GitHub App: grant it Repository permissions -> "Issues: Read" and "Pull requests: Read", and check the installation covers every repo on the board.\n'
             else
               printf '::error ::Running as SIMP_PROJECT_TOKEN: that PAT needs read access to the repositories behind these items.\n'
             fi
-            awk -F'\t' '$1=="unreadable"{printf "::error ::  %s (type=%s)\n", $3, $2}' classes.tsv | head -20 || true
+            awk -F'\t' '$1=="unreadable"{printf "::error ::  %s\n", $3}' classes.tsv | head -20 || true
             {
               echo '## Board Status reconcile'
               echo
