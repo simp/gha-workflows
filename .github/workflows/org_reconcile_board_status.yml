@@ -14,7 +14,8 @@
 #   1. Status  -- move member PRs (and issues they close) between columns
 #   2. Labels  -- `community` on outside contributions (simp/puppetsync#98),
 #                 `needs-attention` on items idle past their column's threshold
-#                 (simp/puppetsync#99, staleness extension)
+#                 (simp/puppetsync#99, staleness extension). Thresholds are
+#                 keyed off the Status the first pass just set.
 #
 # ==============================================================================
 # Mapping (members only)
@@ -65,6 +66,14 @@
 #   surfaces; a human closes.
 # * Put `needs-attention` on anything in `Todo`, `Ready`, `Parked`, `Blocked`
 #   or `Done`. Sitting there is expected; the periodic board review covers it.
+# * Leave a hand-applied `needs-attention` in place. The label is JOB-OWNED --
+#   its description reads "applied and removed automatically" -- so the job
+#   removes it from any column above and from any item whose human activity is
+#   known to be inside the threshold, whoever applied it. Flag a Blocked or
+#   Parked item for the review some other way (a comment, an assignee).
+# * Create a label. `POST .../issues/N/labels` would silently create a missing
+#   label with an arbitrary colour; each (repo, label) is confirmed to exist
+#   first, and a repo without it is a per-item failure instead.
 # * Revert an issue it previously promoted. **Issue promotion is one-way** —
 #   see the note below.
 # * Reconcile an item the credential cannot view. The API reports those with
@@ -136,15 +145,23 @@
 # not reset the clock it measures, and the label cannot flap. A commit whose
 # author has no GitHub account counts as activity (failing towards "fresh").
 #
+# The timeline is read 100 events deep (the API maximum), newest first. If all
+# 100 are bot events, the newest human event is older than the whole window,
+# which yields a LOWER BOUND on idleness rather than the value: the label is
+# added when even that bound exceeds the threshold, and is otherwise left
+# exactly as it is -- neither added nor removed on a guess.
+#
 # The project item's own `updatedAt` is never consulted: it records when the
 # CARD last changed, is floored at 2024-01-25 by past bulk operations, and is
 # blind to anything older.
 #
 # Writes go through the REST labels endpoints (`POST/DELETE
-# /repos/{o}/{r}/issues/{n}/labels`), which serve issues and PRs alike. Both
-# labels were created on every in-scope repo on 2026-08-27 and are org default
-# labels for repos created since; a repo missing one fails that one write,
-# reported per item, and the run continues.
+# /repos/{o}/{r}/issues/{n}/labels`), which serve issues and PRs alike, paced
+# at one per second with a retry on GitHub's secondary rate limit. Both labels
+# were created on every in-scope repo on 2026-08-27 and are org default labels
+# for repos created since. Because the POST endpoint would silently CREATE a
+# missing label, each (repo, label) pair is confirmed to exist before any add;
+# a repo without it is reported as a per-item failure and the run continues.
 #
 # ==============================================================================
 # Credential
@@ -343,7 +360,7 @@ jobs:
                         author{ login __typename }
                         repository{ nameWithOwner }
                         labels(first:50){ nodes{ name } }
-                        timelineItems(last:30, itemTypes:[
+                        timelineItems(last:100, itemTypes:[
                             ISSUE_COMMENT, PULL_REQUEST_REVIEW, PULL_REQUEST_COMMIT,
                             READY_FOR_REVIEW_EVENT, CONVERT_TO_DRAFT_EVENT, REOPENED_EVENT,
                             ASSIGNED_EVENT, REVIEW_REQUESTED_EVENT, RENAMED_TITLE_EVENT]){
@@ -362,7 +379,7 @@ jobs:
                         number state createdAt repository{ nameWithOwner }
                         author{ login __typename }
                         labels(first:50){ nodes{ name } }
-                        timelineItems(last:30, itemTypes:[
+                        timelineItems(last:100, itemTypes:[
                             ISSUE_COMMENT, REOPENED_EVENT, ASSIGNED_EVENT, RENAMED_TITLE_EVENT]){
                           nodes{
                             __typename
@@ -517,7 +534,8 @@ jobs:
             | [ .[] | select(.content != null)
                     | select(.content.__typename == "PullRequest")
                     | select(.content.state == "OPEN")
-                    | (if ([.content.author.login] | inside($members))
+                    | .content.author.login as $item_author
+                    | (if any($members[]; . == $item_author)
                        then "member" else "outside" end) ]
             | group_by(.) | map({k: .[0], n: length}) | .[]
             | "  \(.k): \(.n)"' items.json
@@ -582,7 +600,7 @@ jobs:
           # shellcheck disable=SC2016
           jq -r --slurpfile M members.json '
             ($M[0]) as $members
-            | def member($login): ($login != null) and ([$login] | inside($members));
+            | def member($login): ($login != null) and any($members[]; . == $login);
 
             .[]
             | . as $item
@@ -699,38 +717,57 @@ jobs:
           # ---- compute label changes ----------------------------------------
           # `community` and `needs-attention`; see the Labels section of the
           # header for the rules. Computed from the same items.json snapshot as
-          # the Status pass, so the two passes never disagree about an item.
+          # the Status pass, with each moved item's Status patched to the value
+          # the Status pass just set (or would set, in a dry run). Thresholds are
+          # therefore keyed off the column the item is now in, not the one it
+          # left -- otherwise a New -> In Review promotion would add the label
+          # against New's 7d and remove it against In Review's 14d an hour later.
           #
           # Columns: repo, number, op (add|remove), label, item, reason.
+          jq -Rs 'split("\n") | map(select(length > 0) | split("\t") | {key: .[0], value: .[3]}) | from_entries' \
+            moves.tsv > moves.json
           # shellcheck disable=SC2016
-          jq -r --slurpfile M members.json --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
+          jq -r --slurpfile M members.json --slurpfile MV moves.json \
+                --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
             ($M[0]) as $members
-            | def member($login): ($login != null) and ([$login] | inside($members));
+            | ($MV[0]) as $moved
+            | def member($login): ($login != null) and any($members[]; . == $login);
             def human($a): ($a != null) and ($a.__typename == "User");
             def days_between($from; $to): ((($to | fromdateiso8601) - ($from | fromdateiso8601)) / 86400 | floor);
 
             .[]
             | select(.content != null)
             | select(.content.__typename == "PullRequest" or .content.__typename == "Issue")
-            | ((.fieldValueByName.name) // "(none)") as $cur
+            | ($moved[.id] // .fieldValueByName.name // "(none)") as $cur
             | .content as $c
-            | "\($c.repository.nameWithOwner)#\($c.number)" as $item
+            | "\($c.repository.nameWithOwner)#\($c.number)" as $ref
             | ([$c.labels.nodes[]?.name]) as $labels
             | ($c.state == "OPEN") as $open
             | (human($c.author) and ((member($c.author.login)) | not)) as $outside
 
-            # Newest human activity. Bots are ignored; label events were never
-            # fetched, so this job cannot bump the clock it measures.
-            | ([ (if human($c.author) then $c.createdAt else empty end),
-                 ($c.timelineItems.nodes[]?
-                   | if .__typename == "PullRequestCommit" then
-                       (if (.commit.author.user == null) or human(.commit.author.user)
-                        then .commit.committedDate else empty end)
-                     else
-                       (if human(.author // .actor) then .createdAt else empty end)
-                     end)
-               ] | max) as $last_human
-            | (if $last_human == null then null else days_between($last_human; $now) end) as $idle
+            # Timeline events, normalised to {at, human}. A commit whose author
+            # has no GitHub account counts as human (failing towards "fresh").
+            | ([ $c.timelineItems.nodes[]?
+                 | if .__typename == "PullRequestCommit"
+                   then { at: .commit.committedDate,
+                          human: ((.commit.author.user == null) or human(.commit.author.user)) }
+                   else { at: .createdAt, human: human(.author // .actor) }
+                   end ]) as $events
+            | ([ $events[] | select(.human) | .at ]) as $human_at
+            # The window holds the NEWEST events of the selected types. If it is
+            # full and none of them is human, every human event is older than
+            # the whole window: that gives a lower bound on idleness, not the
+            # value. If it is not full, it is the complete history, and creation
+            # by a human is the floor.
+            | (($events | length) >= 100) as $saturated
+            | (if ($human_at | length) > 0 then ($human_at | max)
+               elif $saturated then null
+               elif human($c.author) then $c.createdAt
+               else null end) as $last_human
+            | (if $last_human != null then days_between($last_human; $now)
+               elif $saturated then days_between(($events | map(.at) | min); $now)
+               else null end) as $idle
+            | ($last_human == null and $idle != null) as $idle_is_lower_bound
 
             | (if ($cur == "Todo" or $cur == "Ready" or $cur == "Parked"
                    or $cur == "Blocked" or $cur == "Done") then null
@@ -740,21 +777,29 @@ jobs:
                elif $cur == "In Review" then 14
                elif $cur == "In Progress" then 30
                else null end) as $threshold
+            # A lower bound past the threshold is still past the threshold.
             | ($threshold != null and $idle != null and $idle >= $threshold) as $want_attn
             | ($labels | index("needs-attention") != null) as $has_attn
+            # Remove only on a positive signal: closed, a column with no
+            # threshold (the label is job-owned; see header), or human activity
+            # KNOWN to be inside the threshold. A lower bound below the
+            # threshold proves nothing, so the label is left alone.
+            | ($has_attn and (($open | not) or $threshold == null
+                              or ($idle != null and ($idle_is_lower_bound | not) and $idle < $threshold))) as $drop_attn
 
             | (if ($outside and $open and ($labels | index("community") == null)) then
-                 [$c.repository.nameWithOwner, $c.number, "add", "community", $item,
+                 [$c.repository.nameWithOwner, $c.number, "add", "community", $ref,
                   "author \($c.author.login) is outside the org"]
                else empty end),
               (if ($want_attn and ($has_attn | not)) then
-                 [$c.repository.nameWithOwner, $c.number, "add", "needs-attention", $item,
-                  "no human activity for \($idle)d (threshold \($threshold)d, Status \($cur))"]
-               elif (($want_attn | not) and $has_attn) then
-                 [$c.repository.nameWithOwner, $c.number, "remove", "needs-attention", $item,
+                 [$c.repository.nameWithOwner, $c.number, "add", "needs-attention", $ref,
+                  (if $idle_is_lower_bound
+                   then "no human among the newest 100 events; idle at least \($idle)d (threshold \($threshold)d, Status \($cur))"
+                   else "no human activity for \($idle)d (threshold \($threshold)d, Status \($cur))" end)]
+               elif $drop_attn then
+                 [$c.repository.nameWithOwner, $c.number, "remove", "needs-attention", $ref,
                   (if ($open | not) then "closed"
-                   elif $threshold == null then "Status \($cur) has no threshold"
-                   elif $idle == null then "no human activity on record"
+                   elif $threshold == null then "Status \($cur) has no threshold (label is job-owned)"
                    else "human activity \($idle)d ago (threshold \($threshold)d)" end)]
                else empty end)
             | @tsv
@@ -784,18 +829,61 @@ jobs:
             awk -F'\t' '{ sign = ($3 == "add") ? "+" : "-";
                           printf "  would label %-46s %s%s  (%s)\n", $5, sign, $4, $6 }' label_ops.tsv
           else
+            # POST .../issues/N/labels CREATES a label that does not exist in
+            # the repo (arbitrary colour, no description). This job must never
+            # do that, so each (repo, label) pair is confirmed to exist once per
+            # run before any add; a missing one is a per-item failure.
+            declare -A LABEL_DEFINED=()
+            label_defined() {  # $1 repo, $2 label -> 0 if the repo defines it
+              local key="$1/$2"
+              if [ -z "${LABEL_DEFINED[$key]:-}" ]; then
+                if gh api "repos/$1/labels/$2" >/dev/null 2>&1; then
+                  LABEL_DEFINED[$key]='yes'
+                else
+                  LABEL_DEFINED[$key]='no'
+                fi
+              fi
+              [ "${LABEL_DEFINED[$key]}" = 'yes' ]
+            }
+
+            # A mutating call, retried on the secondary rate limit. GitHub
+            # reports that limit as HTTP 403 with a body naming it -- the same
+            # status as a permission failure -- and a tight loop of 90-odd writes
+            # is exactly what trips it. Sets $err; returns gh's status.
+            api_write() {
+              local attempt rc=1
+              for attempt in 1 2 3; do
+                err="$(gh api "$@" 2>&1 >/dev/null)" && return 0 || rc=$?
+                case "$err" in
+                  *'secondary rate limit'*|*'abuse detection'*|*'rate limit exceeded'*)
+                    printf '::warning ::rate limited by GitHub; waiting 60s before retry %s/3\n' "$attempt"
+                    sleep 60 ;;
+                  *) return "$rc" ;;
+                esac
+              done
+              return "$rc"
+            }
+
             while IFS=$'\t' read -r repo number op name item reason <&3; do
               err=''
               if [ "$op" = 'add' ]; then
-                err="$(gh api -X POST "repos/${repo}/issues/${number}/labels" \
-                         -f "labels[]=${name}" 2>&1 >/dev/null)" && rc=0 || rc=$?
+                if label_defined "$repo" "$name"; then
+                  api_write -X POST "repos/${repo}/issues/${number}/labels" -f "labels[]=${name}" && rc=0 || rc=$?
+                else
+                  err="label '${name}' is not defined in ${repo}; this job never creates labels"
+                  rc=1
+                fi
               else
-                err="$(gh api -X DELETE "repos/${repo}/issues/${number}/labels/${name}" \
-                         2>&1 >/dev/null)" && rc=0 || rc=$?
-                # 404 on DELETE means the label was already gone: that IS the
-                # desired state, so it is not a failure.
-                case "$err" in *'HTTP 404'*) rc=0 ;; esac
+                api_write -X DELETE "repos/${repo}/issues/${number}/labels/${name}" && rc=0 || rc=$?
+                # Only the 404 that says the label is already absent is the
+                # desired state. A bare "Not Found" 404 is how GitHub reports an
+                # issue or repo the credential cannot reach (deliberately, for
+                # private repos), and that is a failure.
+                case "$err" in *'Label does not exist'*) rc=0 ;; esac
               fi
+              # At least one second between mutating requests, per GitHub's
+              # guidance on avoiding the secondary rate limit.
+              sleep 1
               if [ "$rc" -eq 0 ]; then
                 if [ "$op" = 'remove' ]; then sign='-'; else sign='+'; fi
                 printf '  labelled %-46s %s%s  (%s)\n' "$item" "$sign" "$name" "$reason"
