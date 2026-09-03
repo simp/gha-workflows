@@ -40,6 +40,7 @@ namespaced by the kind of repo they serve:
 |---|---|
 | [`puppet_create_release_tag.yml`](.github/workflows/puppet_create_release_tag.yml) | Validate `metadata.json`/CHANGELOG and create + push an annotated release tag (triggering the repo's `tag_deploy.yml`) |
 | [`org_sync_forks.yml`](.github/workflows/org_sync_forks.yml) | Weekly: fast-forward the org's pure-mirror forks from their upstreams. Skips any fork carrying SIMP commits |
+| [`org_reconcile_board_status.yml`](.github/workflows/org_reconcile_board_status.yml) | Hourly: reconcile the [Org Triage board](https://github.com/orgs/simp/projects/11) with live state — Status from member PRs (draft → In Progress, ready → In Review, …), `community` on outside contributions, `needs-attention` on items idle past their column's threshold. Never moves items out of Blocked/Parked/Done, never closes anything |
 
 ## Calling a workflow
 
