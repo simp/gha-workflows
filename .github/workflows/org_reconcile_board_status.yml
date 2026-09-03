@@ -1,4 +1,4 @@
-# Scheduled org job: reconcile Org Triage board Status from live PR state
+# Scheduled org job: reconcile Org Triage board Status and labels from live state
 # ------------------------------------------------------------------------------
 #
 # Not a reusable workflow — it runs here on a schedule and reaches the org
@@ -8,6 +8,13 @@
 # instead of leaving a card wrong forever. See simp/puppetsync#99.
 #
 # Board: https://github.com/orgs/simp/projects/11
+#
+# Two passes, in order, over the same snapshot of the board:
+#
+#   1. Status  -- move member PRs (and issues they close) between columns
+#   2. Labels  -- `community` on outside contributions (simp/puppetsync#98),
+#                 `needs-attention` on items idle past their column's threshold
+#                 (simp/puppetsync#99, staleness extension)
 #
 # ==============================================================================
 # Mapping (members only)
@@ -50,7 +57,14 @@
 #   review's decisions on its next tick. All three names are asserted to exist
 #   at start-up, so renaming a column fails the run instead of silently
 #   disarming the guard.
-# * Touch any field other than Status.
+# * Touch any field other than Status, or any label other than `community` and
+#   `needs-attention`.
+# * Remove `community`. It records a permanent property of the contribution.
+# * Close anything. A stale-closer would fire hardest on first-time
+#   contributors -- exactly the people the board must not lose. It labels and
+#   surfaces; a human closes.
+# * Put `needs-attention` on anything in `Todo`, `Ready`, `Parked`, `Blocked`
+#   or `Done`. Sitting there is expected; the periodic board review covers it.
 # * Revert an issue it previously promoted. **Issue promotion is one-way** —
 #   see the note below.
 # * Reconcile an item the credential cannot view. The API reports those with
@@ -90,17 +104,65 @@
 # when its PR was never added as a project item.
 #
 # ==============================================================================
+# Labels
+#
+# `community` (sticky) -- applied to every OPEN issue or PR on the board whose
+# author is a human (`User`, not `Bot`) outside the org member list. Never
+# removed by this job. It is applied here rather than by the per-repo intake
+# workflow because the event payload's `author_association` reports private org
+# members as CONTRIBUTOR, which would have labelled most of the team's own work
+# as outside contributions. Only board items are labelled: an outside PR in a
+# repo without the intake workflow (simp/puppetsync#96) is not seen here.
+#
+# `needs-attention` (transient) -- applied when an item has had no HUMAN
+# activity for longer than its column's threshold, and removed as soon as it
+# has. Thresholds, in days, from the board plan:
+#
+#     `community` item (anywhere it is eligible) ...  7
+#     New, or no Status ..............................  7   (triage isn't happening)
+#     In Review ...................................... 14   (one review cycle)
+#     In Progress .................................... 30
+#     Todo / Ready / Parked / Blocked / Done ......... never
+#
+# A flat threshold does not work: measured 2026-08-27, "14 days idle" would
+# have flagged 83% of the board. Staleness is only meaningful relative to what
+# the item is waiting on.
+#
+# "Human activity" is the newest of: the item's creation (if by a human), and
+# any comment, review, commit, ready-for-review / convert-to-draft, reopen,
+# assignment, review request or retitle whose actor is a `User`. Actors of type
+# `Bot` are ignored (Renovate rebases, CI comments, Copilot), and LABELED /
+# UNLABELED events are not fetched at all -- so applying `needs-attention` does
+# not reset the clock it measures, and the label cannot flap. A commit whose
+# author has no GitHub account counts as activity (failing towards "fresh").
+#
+# The project item's own `updatedAt` is never consulted: it records when the
+# CARD last changed, is floored at 2024-01-25 by past bulk operations, and is
+# blind to anything older.
+#
+# Writes go through the REST labels endpoints (`POST/DELETE
+# /repos/{o}/{r}/issues/{n}/labels`), which serve issues and PRs alike. Both
+# labels were created on every in-scope repo on 2026-08-27 and are org default
+# labels for repos created since; a repo missing one fails that one write,
+# reported per item, and the run continues.
+#
+# ==============================================================================
 # Credential
 #
 # Prefers the org-owned GitHub App, which needs ALL of:
 #
 #     Repository permissions   -> Metadata: Read
-#     Repository permissions   -> Issues: Read
-#     Repository permissions   -> Pull requests: Read
+#     Repository permissions   -> Issues: Read and write
+#     Repository permissions   -> Pull requests: Read and write
 #     Organization permissions -> Members: Read
 #     Organization permissions -> Projects: Read and write
 #
 # ...and an installation covering every repository represented on the board.
+# Issues/Pull requests need WRITE for the labels pass; the Status pass alone
+# works with Read. (The PAT fallback needs the `repo` scope for the same
+# reason.) A credential that can read but not write labels completes the
+# Status pass and then aborts on the first label write, so the board's Status
+# is never left behind by a permission gap in the newer pass.
 #
 # The Projects grant alone is not enough: it lets the App read the project and
 # write Status, but the mapping is computed from the issues and pull requests
@@ -277,11 +339,37 @@ jobs:
                       __typename
                       ... on DraftIssue{ title }
                       ... on PullRequest{
-                        number isDraft reviewDecision state
-                        author{ login }
-                        repository{ nameWithOwner } }
+                        number isDraft reviewDecision state createdAt
+                        author{ login __typename }
+                        repository{ nameWithOwner }
+                        labels(first:50){ nodes{ name } }
+                        timelineItems(last:30, itemTypes:[
+                            ISSUE_COMMENT, PULL_REQUEST_REVIEW, PULL_REQUEST_COMMIT,
+                            READY_FOR_REVIEW_EVENT, CONVERT_TO_DRAFT_EVENT, REOPENED_EVENT,
+                            ASSIGNED_EVENT, REVIEW_REQUESTED_EVENT, RENAMED_TITLE_EVENT]){
+                          nodes{
+                            __typename
+                            ... on IssueComment{ createdAt author{ login __typename } }
+                            ... on PullRequestReview{ createdAt author{ login __typename } }
+                            ... on PullRequestCommit{ commit{ committedDate author{ user{ login __typename } } } }
+                            ... on ReadyForReviewEvent{ createdAt actor{ login __typename } }
+                            ... on ConvertToDraftEvent{ createdAt actor{ login __typename } }
+                            ... on ReopenedEvent{ createdAt actor{ login __typename } }
+                            ... on AssignedEvent{ createdAt actor{ login __typename } }
+                            ... on ReviewRequestedEvent{ createdAt actor{ login __typename } }
+                            ... on RenamedTitleEvent{ createdAt actor{ login __typename } } } } }
                       ... on Issue{
-                        number state repository{ nameWithOwner }
+                        number state createdAt repository{ nameWithOwner }
+                        author{ login __typename }
+                        labels(first:50){ nodes{ name } }
+                        timelineItems(last:30, itemTypes:[
+                            ISSUE_COMMENT, REOPENED_EVENT, ASSIGNED_EVENT, RENAMED_TITLE_EVENT]){
+                          nodes{
+                            __typename
+                            ... on IssueComment{ createdAt author{ login __typename } }
+                            ... on ReopenedEvent{ createdAt actor{ login __typename } }
+                            ... on AssignedEvent{ createdAt actor{ login __typename } }
+                            ... on RenamedTitleEvent{ createdAt actor{ login __typename } } } }
                         closedByPullRequestsReferences(first:20, includeClosedPrs:false){
                           nodes{ number state author{ login } } } } } } } } } }' \
             -f org="$ORG" -F num="$PROJECT_NUMBER" > raw.json 2> gh_stderr.txt; then
@@ -548,68 +636,209 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
-          if [ "${moves}" = '0' ] || [ "${DRY_RUN}" = 'true' ]; then
-            awk -F'\t' '{printf "  would move %-46s %s -> %s\n", $2, $3, $4}' moves.tsv
-            exit 0
-          fi
-
-          # ---- apply ---------------------------------------------------------
+          # ---- apply Status --------------------------------------------------
           applied=0; failed=0
           : > failures.txt
-          # Read on fd 3: nothing in this loop currently consumes stdin, but a
-          # command that did would silently swallow the remaining moves.
-          while IFS=$'\t' read -r item_id label cur want <&3; do
-            option_id="$(opt "$want")"
-            err=''
-            # shellcheck disable=SC2016
-            if err="$(gh api graphql -f query='
-                  mutation($p:ID!,$i:ID!,$f:ID!,$o:String!){
-                    updateProjectV2ItemFieldValue(input:{
-                      projectId:$p, itemId:$i, fieldId:$f,
-                      value:{ singleSelectOptionId:$o } }){
-                      projectV2Item{ id } } }' \
-                  -f p="$PROJECT_ID" -f i="$item_id" -f f="$FIELD_ID" -f o="$option_id" \
-                  2>&1 >/dev/null)"; then
-              printf '  moved %-46s %s -> %s\n' "$label" "$cur" "$want"
-              applied=$((applied + 1))
-            else
-              trimmed="$(printf '%s' "$err" | tr -d '\n' | cut -c1-160)"
-              case "$err" in
-                *FORBIDDEN*|*INSUFFICIENT_SCOPES*|*'not have permission'*|*'Resource not accessible'*)
-                  # Systemic: every remaining move would fail the same way.
-                  # Abort now rather than making 40-odd more pointless calls.
-                  printf '::error ::%s: credential cannot write the org project: %s\n' \
-                    "$label" "$trimmed"
-                  printf '::error ::Aborting after the first permission failure. Grant the '
-                  printf 'App "Organization permissions -> Projects: Read and write".\n'
-                  { echo
-                    echo "**Aborted before any move was applied** — the credential"
-                    echo "cannot write the org project. None of the moves listed"
-                    echo "above were made."
-                  } >> "$GITHUB_STEP_SUMMARY"
-                  exit 1 ;;
-                *)
-                  printf '::error ::%s: failed to set Status to %s: %s\n' \
-                    "$label" "$want" "$trimmed"
-                  printf '%s\t%s\n' "$label" "$trimmed" >> failures.txt
-                  failed=$((failed + 1)) ;;
-              esac
-            fi
-          done 3< moves.tsv
+          if [ "${moves}" = '0' ] || [ "${DRY_RUN}" = 'true' ]; then
+            awk -F'\t' '{printf "  would move %-46s %s -> %s\n", $2, $3, $4}' moves.tsv
+          else
+            # Read on fd 3: nothing in this loop currently consumes stdin, but a
+            # command that did would silently swallow the remaining moves.
+            while IFS=$'\t' read -r item_id label cur want <&3; do
+              option_id="$(opt "$want")"
+              err=''
+              # shellcheck disable=SC2016
+              if err="$(gh api graphql -f query='
+                    mutation($p:ID!,$i:ID!,$f:ID!,$o:String!){
+                      updateProjectV2ItemFieldValue(input:{
+                        projectId:$p, itemId:$i, fieldId:$f,
+                        value:{ singleSelectOptionId:$o } }){
+                        projectV2Item{ id } } }' \
+                    -f p="$PROJECT_ID" -f i="$item_id" -f f="$FIELD_ID" -f o="$option_id" \
+                    2>&1 >/dev/null)"; then
+                printf '  moved %-46s %s -> %s\n' "$label" "$cur" "$want"
+                applied=$((applied + 1))
+              else
+                trimmed="$(printf '%s' "$err" | tr -d '\n' | cut -c1-160)"
+                case "$err" in
+                  *FORBIDDEN*|*INSUFFICIENT_SCOPES*|*'not have permission'*|*'Resource not accessible'*)
+                    # Systemic: every remaining move would fail the same way.
+                    # Abort now rather than making 40-odd more pointless calls.
+                    printf '::error ::%s: credential cannot write the org project: %s\n' \
+                      "$label" "$trimmed"
+                    printf '::error ::Aborting after the first permission failure. Grant the '
+                    printf 'App "Organization permissions -> Projects: Read and write".\n'
+                    { echo
+                      echo "**Aborted before any move was applied** — the credential"
+                      echo "cannot write the org project. None of the moves listed"
+                      echo "above were made."
+                    } >> "$GITHUB_STEP_SUMMARY"
+                    exit 1 ;;
+                  *)
+                    printf '::error ::%s: failed to set Status to %s: %s\n' \
+                      "$label" "$want" "$trimmed"
+                    printf '%s\t%s\n' "$label" "$trimmed" >> failures.txt
+                    failed=$((failed + 1)) ;;
+                esac
+              fi
+            done 3< moves.tsv
 
-          echo "applied=${applied} failed=${failed}"
+            echo "applied=${applied} failed=${failed}"
+            {
+              echo
+              echo "**applied ${applied} · failed ${failed}**"
+              if [ "$failed" -gt 0 ]; then
+                echo
+                echo '### Failures'
+                echo
+                awk -F'\t' '{printf "- `%s` — %s\n", $1, $2}' failures.txt
+              fi
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          # ---- compute label changes ----------------------------------------
+          # `community` and `needs-attention`; see the Labels section of the
+          # header for the rules. Computed from the same items.json snapshot as
+          # the Status pass, so the two passes never disagree about an item.
+          #
+          # Columns: repo, number, op (add|remove), label, item, reason.
+          # shellcheck disable=SC2016
+          jq -r --slurpfile M members.json --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
+            ($M[0]) as $members
+            | def member($login): ($login != null) and ([$login] | inside($members));
+            def human($a): ($a != null) and ($a.__typename == "User");
+            def days_between($from; $to): ((($to | fromdateiso8601) - ($from | fromdateiso8601)) / 86400 | floor);
+
+            .[]
+            | select(.content != null)
+            | select(.content.__typename == "PullRequest" or .content.__typename == "Issue")
+            | ((.fieldValueByName.name) // "(none)") as $cur
+            | .content as $c
+            | "\($c.repository.nameWithOwner)#\($c.number)" as $item
+            | ([$c.labels.nodes[]?.name]) as $labels
+            | ($c.state == "OPEN") as $open
+            | (human($c.author) and ((member($c.author.login)) | not)) as $outside
+
+            # Newest human activity. Bots are ignored; label events were never
+            # fetched, so this job cannot bump the clock it measures.
+            | ([ (if human($c.author) then $c.createdAt else empty end),
+                 ($c.timelineItems.nodes[]?
+                   | if .__typename == "PullRequestCommit" then
+                       (if (.commit.author.user == null) or human(.commit.author.user)
+                        then .commit.committedDate else empty end)
+                     else
+                       (if human(.author // .actor) then .createdAt else empty end)
+                     end)
+               ] | max) as $last_human
+            | (if $last_human == null then null else days_between($last_human; $now) end) as $idle
+
+            | (if ($cur == "Todo" or $cur == "Ready" or $cur == "Parked"
+                   or $cur == "Blocked" or $cur == "Done") then null
+               elif ($open | not) then null
+               elif ($outside or ($labels | index("community") != null)) then 7
+               elif ($cur == "New" or $cur == "(none)") then 7
+               elif $cur == "In Review" then 14
+               elif $cur == "In Progress" then 30
+               else null end) as $threshold
+            | ($threshold != null and $idle != null and $idle >= $threshold) as $want_attn
+            | ($labels | index("needs-attention") != null) as $has_attn
+
+            | (if ($outside and $open and ($labels | index("community") == null)) then
+                 [$c.repository.nameWithOwner, $c.number, "add", "community", $item,
+                  "author \($c.author.login) is outside the org"]
+               else empty end),
+              (if ($want_attn and ($has_attn | not)) then
+                 [$c.repository.nameWithOwner, $c.number, "add", "needs-attention", $item,
+                  "no human activity for \($idle)d (threshold \($threshold)d, Status \($cur))"]
+               elif (($want_attn | not) and $has_attn) then
+                 [$c.repository.nameWithOwner, $c.number, "remove", "needs-attention", $item,
+                  (if ($open | not) then "closed"
+                   elif $threshold == null then "Status \($cur) has no threshold"
+                   elif $idle == null then "no human activity on record"
+                   else "human activity \($idle)d ago (threshold \($threshold)d)" end)]
+               else empty end)
+            | @tsv
+          ' items.json > label_ops.tsv
+
+          label_ops="$(wc -l < label_ops.tsv | tr -d ' ')"
+          echo "label changes required: ${label_ops}"
+
           {
             echo
-            echo "**applied ${applied} · failed ${failed}**"
-            if [ "$failed" -gt 0 ]; then
-              echo
-              echo '### Failures'
-              echo
-              awk -F'\t' '{printf "- `%s` — %s\n", $1, $2}' failures.txt
+            echo '### Labels'
+            echo
+            if [ "${label_ops}" = '0' ]; then
+              echo 'Labels already match; no changes required.'
+            else
+              echo '| Item | Change | Reason |'
+              echo '|---|---|---|'
+              awk -F'\t' '{ sign = ($3 == "add") ? "+" : "-";
+                            printf "| %s | %s`%s` | %s |\n", $5, sign, $4, $6 }' label_ops.tsv
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
-          if [ "$failed" -gt 0 ]; then
-            printf '::error ::%s Status update(s) failed\n' "$failed"
+          # ---- apply labels --------------------------------------------------
+          lapplied=0; lfailed=0
+          : > label_failures.txt
+          if [ "${label_ops}" = '0' ] || [ "${DRY_RUN}" = 'true' ]; then
+            awk -F'\t' '{ sign = ($3 == "add") ? "+" : "-";
+                          printf "  would label %-46s %s%s  (%s)\n", $5, sign, $4, $6 }' label_ops.tsv
+          else
+            while IFS=$'\t' read -r repo number op name item reason <&3; do
+              err=''
+              if [ "$op" = 'add' ]; then
+                err="$(gh api -X POST "repos/${repo}/issues/${number}/labels" \
+                         -f "labels[]=${name}" 2>&1 >/dev/null)" && rc=0 || rc=$?
+              else
+                err="$(gh api -X DELETE "repos/${repo}/issues/${number}/labels/${name}" \
+                         2>&1 >/dev/null)" && rc=0 || rc=$?
+                # 404 on DELETE means the label was already gone: that IS the
+                # desired state, so it is not a failure.
+                case "$err" in *'HTTP 404'*) rc=0 ;; esac
+              fi
+              if [ "$rc" -eq 0 ]; then
+                if [ "$op" = 'remove' ]; then sign='-'; else sign='+'; fi
+                printf '  labelled %-46s %s%s  (%s)\n' "$item" "$sign" "$name" "$reason"
+                lapplied=$((lapplied + 1))
+              else
+                trimmed="$(printf '%s' "$err" | tr -d '\n' | cut -c1-160)"
+                case "$err" in
+                  *'HTTP 403'*|*'Resource not accessible'*)
+                    # Systemic: the credential can read but not write labels.
+                    printf '::error ::%s: credential cannot write labels: %s\n' "$item" "$trimmed"
+                    printf '::error ::Aborting the labels pass after the first permission failure. '
+                    printf 'Grant the App Repository permissions -> "Issues: Read and write" and '
+                    printf '"Pull requests: Read and write" (a PAT needs the repo scope). '
+                    printf 'The Status pass above completed normally.\n'
+                    { echo
+                      echo '**Labels pass aborted** — the credential cannot write labels.'
+                      echo 'Grant the App **Repository permissions -> Issues: Read and write**'
+                      echo 'and **Pull requests: Read and write**. The Status pass was not'
+                      echo 'affected.'
+                    } >> "$GITHUB_STEP_SUMMARY"
+                    exit 1 ;;
+                  *)
+                    printf '::error ::%s: failed to %s %s: %s\n' "$item" "$op" "$name" "$trimmed"
+                    printf '%s\t%s %s: %s\n' "$item" "$op" "$name" "$trimmed" >> label_failures.txt
+                    lfailed=$((lfailed + 1)) ;;
+                esac
+              fi
+            done 3< label_ops.tsv
+
+            echo "labels applied=${lapplied} failed=${lfailed}"
+            {
+              echo
+              echo "**labels applied ${lapplied} · failed ${lfailed}**"
+              if [ "$lfailed" -gt 0 ]; then
+                echo
+                echo '#### Label failures'
+                echo
+                awk -F'\t' '{printf "- `%s` — %s\n", $1, $2}' label_failures.txt
+              fi
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          if [ "$failed" -gt 0 ] || [ "$lfailed" -gt 0 ]; then
+            printf '::error ::%s Status update(s) and %s label change(s) failed\n' "$failed" "$lfailed"
             exit 1
           fi
