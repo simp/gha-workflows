@@ -341,11 +341,18 @@ jobs:
           # body carries a top-level `errors` array -- even on HTTP 200 with
           # partial `data` -- but it writes the body to stdout *before* failing,
           # so raw.json still holds the detail we want to report.
+          #
+          # Pages are deliberately small. Each item pulls up to 100 timeline
+          # events, and GitHub abandons a GraphQL request at ~10s with a 502/504
+          # (or a truncated body). Measured on the live board (2026-10-08): 100
+          # items/page took up to 9.6s and 3 of 9 requests failed; 25 still hit
+          # 7.8s, because a few long-timeline cards dominate; 10 peaked at 4.3s.
+          # The extra pages add ~10s per run and negligible rate-limit cost.
           # shellcheck disable=SC2016
           if ! gh api graphql --paginate -f query='
             query($org:String!,$num:Int!,$endCursor:String){
               organization(login:$org){ projectV2(number:$num){
-                items(first:100, after:$endCursor){
+                items(first:10, after:$endCursor){
                   pageInfo{ hasNextPage endCursor }
                   nodes{
                     id
