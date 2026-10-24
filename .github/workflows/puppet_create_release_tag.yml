@@ -83,7 +83,7 @@ jobs:
           fi
           echo "version=${version}" | tee -a "$GITHUB_OUTPUT"
 
-      - uses: ruby/setup-ruby@v1
+      - uses: ruby/setup-ruby@v1.334.0
         with:
           ruby-version: '4.0.9'
           bundler-cache: true
