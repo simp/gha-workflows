@@ -1,4 +1,5 @@
-# Lint this repo's workflows (including the reusable ones) on every PR
+# Lint this repo's workflows (including the reusable ones) and test its
+# actions on every PR
 ---
 name: CI
 
@@ -16,15 +17,121 @@ jobs:
         run: |
           bash <(curl -s https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
           ./actionlint -color
+      - name: Run shellcheck on the actions' scripts
+        run: shellcheck .github/actions/*/*.bash
+
+  # Which of the jobs below this PR needs. The action's tests depend on
+  # Launchpad, so they only run when the action or this workflow changes:
+  # an outage then can't block an unrelated fix.
+  changes:
+    name: 'Changed paths'
+    runs-on: ubuntu-latest
+    outputs:
+      vagrant: ${{ steps.diff.outputs.vagrant }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - id: diff
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          git diff --name-only "$BASE" HEAD | tee changed
+          if grep -qE '^\.github/(actions/setup-vagrant-libvirt/|workflows/ci\.yml$)' changed; then
+            echo 'vagrant=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'vagrant=false' >> "$GITHUB_OUTPUT"
+          fi
+
+  # The setup-vagrant-libvirt action, run on real runners in each mode:
+  # cache-only first, so the install jobs that follow can restore its packages
+  vagrant-cache:
+    name: 'setup-vagrant-libvirt: cache-only (${{ matrix.runner }})'
+    needs: changes
+    if: needs.changes.outputs.vagrant == 'true'
+    strategy:
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-latest]
+      fail-fast: false
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: vagrant
+        uses: ./.github/actions/setup-vagrant-libvirt
+        with:
+          cache-only: 'true'
+      - name: Check the result
+        env:
+          SOURCE: ${{ steps.vagrant.outputs.source }}
+        run: |
+          echo "source: ${SOURCE}"
+          . /etc/os-release
+          if [ "$VERSION_CODENAME" = 'noble' ]; then
+            [[ "$SOURCE" =~ ^(cached|saved)$ ]]
+          else
+            [ "$SOURCE" = 'none' ]
+          fi
+          ! command -v vagrant
+
+  # `noble` is the source expected where the runner is on noble, which the
+  # PPA publishes for; on any other series it is always hashicorp. The
+  # ubuntu-latest row is a canary for whatever series that label resolves to
+  # (currently 26.04, so HashiCorp), the way consuming repos run.
+  vagrant-install:
+    name: 'setup-vagrant-libvirt: install (${{ matrix.runner }}, ${{ matrix.case }})'
+    needs: [changes, vagrant-cache]
+    if: needs.changes.outputs.vagrant == 'true'
+    strategy:
+      matrix:
+        include:
+          - {runner: ubuntu-24.04, case: cache hit, cache: 'true', launchpad: reachable, noble: cache}
+          - {runner: ubuntu-24.04, case: 'cache hit, Launchpad blocked', cache: 'true', launchpad: blocked, noble: cache}
+          - {runner: ubuntu-24.04, case: PPA, cache: 'false', launchpad: reachable, noble: ppa}
+          - {runner: ubuntu-24.04, case: 'PPA down, HashiCorp fallback', cache: 'false', launchpad: blocked, noble: hashicorp}
+          - {runner: ubuntu-latest, case: as consuming repos run, cache: 'true', launchpad: reachable, noble: cache}
+      fail-fast: false
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Block Launchpad
+        if: matrix.launchpad == 'blocked'
+        run: |
+          for host in ppa.launchpadcontent.net ppa.launchpad.net api.launchpad.net launchpad.net keyserver.ubuntu.com; do
+            echo "0.0.0.0 ${host}" | sudo tee -a /etc/hosts
+          done
+      - id: vagrant
+        uses: ./.github/actions/setup-vagrant-libvirt
+        with:
+          cache: ${{ matrix.cache }}
+      - name: Check the result
+        env:
+          SOURCE: ${{ steps.vagrant.outputs.source }}
+          NOBLE: ${{ matrix.noble }}
+        run: |
+          . /etc/os-release
+          expected=hashicorp
+          if [ "$VERSION_CODENAME" = 'noble' ]; then
+            expected=$NOBLE
+          fi
+          echo "source: ${SOURCE} (expected ${expected})"
+          [ "$SOURCE" = "$expected" ]
+          vagrant --version
+          vagrant plugin list | grep vagrant-libvirt
+          virsh --connect qemu:///system list --all
 
   # The one check for branch protection to require: GitHub only blocks a
   # merge on checks listed by name, and this job fails unless every job it
-  # needs succeeded. Add any new job in this workflow to `needs:`.
+  # needs succeeded or was skipped (the action tests, when `changes` says
+  # this PR doesn't touch the action). Add any new job in this workflow to
+  # `needs:`.
   all-checks:
     name: 'All checks'
     if: always()
     needs:
       - actionlint
+      - changes
+      - vagrant-cache
+      - vagrant-install
     runs-on: ubuntu-latest
     steps:
       - name: 'Fail unless every needed job succeeded'
@@ -32,4 +139,4 @@ jobs:
           NEEDS: ${{ toJSON(needs) }}
         run: |
           jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<< "$NEEDS"
-          jq -e 'all(.[]; .result == "success")' <<< "$NEEDS" > /dev/null
+          jq -e 'all(.[]; .result == "success" or .result == "skipped")' <<< "$NEEDS" > /dev/null

@@ -1,0 +1,123 @@
+---
+name: 'Set up Vagrant with libvirt'
+description: >-
+  Install Vagrant, vagrant-libvirt and libvirt on an Ubuntu runner from
+  ppa:evgeni/vagrant, the Actions cache, or HashiCorp's apt repository,
+  so a Launchpad outage doesn't fail the job.
+
+inputs:
+  cache-only:
+    description: >-
+      'true' to save the PPA's packages to the Actions cache instead of
+      installing anything. Run it from the default branch (push, schedule)
+      so pull requests can restore the cache.
+    required: false
+    default: 'false'
+  cache:
+    description: "'false' to ignore the Actions cache when installing"
+    required: false
+    default: 'true'
+  ppa-series:
+    description: >-
+      Space-separated Ubuntu codenames that ppa:evgeni/vagrant publishes
+      for. On any other series the action goes straight to HashiCorp.
+    required: false
+    default: 'noble'
+  vagrant-version:
+    description: "HashiCorp's apt version of vagrant, for the fallback when the PPA can't be used"
+    required: false
+    default: '2.4.9-1'
+  vagrant-libvirt-version:
+    description: 'The vagrant-libvirt plugin version installed with HashiCorp vagrant'
+    required: false
+    default: '0.12.2'
+
+outputs:
+  source:
+    description: >-
+      Where Vagrant came from: 'cache', 'ppa' or 'hashicorp' (install), or
+      'cached', 'saved' or 'none' (cache-only)
+    value: ${{ steps.install.outputs.source || steps.result.outputs.source }}
+
+runs:
+  using: composite
+  steps:
+    - name: Check the Ubuntu series
+      id: series
+      shell: bash
+      env:
+        PPA_SERIES: ${{ inputs.ppa-series }}
+      run: '"$GITHUB_ACTION_PATH/setup-vagrant-libvirt.bash" series'
+
+    # Install: restore the newest cached package set, if any
+    - name: Restore the cached PPA packages
+      if: >-
+        inputs.cache-only != 'true' && inputs.cache != 'false' &&
+        steps.series.outputs.ppa == 'true'
+      uses: actions/cache/restore@v6
+      with:
+        path: ${{ steps.series.outputs.dir }}
+        key: ${{ steps.series.outputs.prefix }}
+        restore-keys: ${{ steps.series.outputs.prefix }}
+
+    - name: Install Vagrant and libvirt
+      id: install
+      if: inputs.cache-only != 'true'
+      shell: bash
+      env:
+        DEBS: ${{ steps.series.outputs.dir }}
+        PPA: ${{ steps.series.outputs.ppa }}
+        CODENAME: ${{ steps.series.outputs.codename }}
+        VAGRANT_VERSION: ${{ inputs.vagrant-version }}
+        VAGRANT_LIBVIRT_VERSION: ${{ inputs.vagrant-libvirt-version }}
+      run: '"$GITHUB_ACTION_PATH/setup-vagrant-libvirt.bash" install'
+
+    # Cache-only: name the PPA's current packages, then save them once
+    - name: Resolve the PPA packages
+      id: resolve
+      if: inputs.cache-only == 'true' && steps.series.outputs.ppa == 'true'
+      shell: bash
+      env:
+        PREFIX: ${{ steps.series.outputs.prefix }}
+      run: '"$GITHUB_ACTION_PATH/setup-vagrant-libvirt.bash" resolve'
+
+    # A restore of an existing key also keeps it from being evicted
+    - name: Check the cache
+      id: cached
+      if: steps.resolve.outcome == 'success'
+      uses: actions/cache/restore@v6
+      with:
+        path: ${{ steps.series.outputs.dir }}
+        key: ${{ steps.resolve.outputs.key }}
+
+    - name: Download the PPA packages
+      if: steps.resolve.outcome == 'success' && steps.cached.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        DEBS: ${{ steps.series.outputs.dir }}
+      run: '"$GITHUB_ACTION_PATH/setup-vagrant-libvirt.bash" download'
+
+    - name: Save the PPA packages
+      if: steps.resolve.outcome == 'success' && steps.cached.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v6
+      with:
+        path: ${{ steps.series.outputs.dir }}
+        key: ${{ steps.resolve.outputs.key }}
+
+    - name: Report the cache result
+      id: result
+      if: inputs.cache-only == 'true'
+      shell: bash
+      env:
+        PPA: ${{ steps.series.outputs.ppa }}
+        CODENAME: ${{ steps.series.outputs.codename }}
+        HIT: ${{ steps.cached.outputs.cache-hit }}
+      run: |
+        if [ "$PPA" != 'true' ]; then
+          echo "::notice::ppa:evgeni/vagrant has no packages for Ubuntu ${CODENAME}; nothing to cache"
+          echo 'source=none' >> "$GITHUB_OUTPUT"
+        elif [ "$HIT" = 'true' ]; then
+          echo 'source=cached' >> "$GITHUB_OUTPUT"
+        else
+          echo 'source=saved' >> "$GITHUB_OUTPUT"
+        fi
